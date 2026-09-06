@@ -28,6 +28,9 @@
 #ifdef HAVE_PTRAUTH
 # include <ptrauth.h>
 #endif
+#ifdef HAVE_TINY_STACK
+# include <gum/gumbarebone.h>
+#endif
 
 #define GUM_QUICK_FFI_FUNCTION_PARAMS_EMPTY { NULL, }
 
@@ -2050,6 +2053,13 @@ _gum_quick_scope_enter (GumQuickScope * self,
     core->current_owner = gum_process_get_current_thread_id ();
 
     JS_Enter (core->rt);
+#ifdef HAVE_TINY_STACK
+    {
+      gsize available = gum_barebone_query_stack_size ();
+      if (available != 0)
+        JS_SetMaxStackSize (core->rt, available - available / 4);
+    }
+#endif
 
     _gum_quick_script_on_scope_entered (core);
   }
@@ -5872,9 +5882,9 @@ gum_quick_exception_sink_handle_exception (GumQuickExceptionSink * self,
 
   result = JS_Call (ctx, self->callback, JS_UNDEFINED, 1, &exception);
   if (JS_IsException (result))
-    _gum_quick_panic (ctx, "Error handler crashed");
-
-  JS_FreeValue (ctx, result);
+    JS_FreeValue (ctx, JS_GetException (ctx));
+  else
+    JS_FreeValue (ctx, result);
 }
 
 static GumQuickMessageSink *
