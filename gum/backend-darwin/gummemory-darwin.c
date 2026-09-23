@@ -1,6 +1,8 @@
 /*
  * Copyright (C) 2010-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2025-2026 Francesco Tamagni <mrmacete@protonmail.ch>
+ * Copyright (C) 2026 Paul de Terrasson de Montleau <devnoname120@gmail.com>
+ * Copyright (C) 2026 Jiska Classen <jclassen@seemoo.tu-darmstadt.de>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -11,6 +13,7 @@
 #include "gumdarwin-priv.h"
 #include "gummemory-priv.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <unistd.h>
 #include <libkern/OSCacheControl.h>
@@ -23,7 +26,19 @@
 typedef gboolean (* GumFoundFreeRangeFunc) (const GumMemoryRange * range,
     gpointer user_data);
 
+typedef struct _GumJailbreakMemoryHooks GumJailbreakMemoryHooks;
 typedef struct _GumAllocNearContext GumAllocNearContext;
+
+/* Process-local ABI, shared with Dopamine's memory_hooks.h. */
+struct _GumJailbreakMemoryHooks
+{
+  guint32 version;
+  guint32 size;
+  kern_return_t (* patch_code) (void * address, const void * data,
+      size_t size);
+  kern_return_t (* protect) (mach_port_t task, mach_vm_address_t address,
+      mach_vm_size_t size, boolean_t set_maximum, vm_prot_t protection);
+};
 
 struct _GumAllocNearContext
 {
@@ -43,6 +58,8 @@ extern kern_return_t mach_vm_page_info (vm_map_read_t target_task,
 static kern_return_t gum_mach_vm_protect (vm_map_t target_task,
     mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum,
     vm_prot_t new_protection);
+static kern_return_t gum_protect_with_copy_fallback (vm_map_t task,
+    mach_vm_address_t address, mach_vm_size_t size, vm_prot_t prot);
 static gpointer gum_allocate_page_aligned (gpointer address, gsize size,
     gint prot);
 static gboolean gum_try_alloc_in_range_if_near_enough (
@@ -52,14 +69,32 @@ static gboolean gum_try_suggest_allocation_base (const GumMemoryRange * range,
 static gint gum_page_protection_to_bsd (GumPageProtection prot);
 static gboolean gum_page_is_freshly_allocated (gpointer page, gsize size);
 
+static const GumJailbreakMemoryHooks * gum_jailbreak_memory_hooks = NULL;
+
 void
 _gum_memory_backend_init (void)
 {
+#ifdef HAVE_JAILBREAK
+  const GumJailbreakMemoryHooks * (* query) (guint32 version);
+  const GumJailbreakMemoryHooks * hooks;
+
+  query = dlsym (RTLD_DEFAULT, "jb_get_memory_hooks");
+  if (query == NULL)
+    return;
+
+  hooks = query (1);
+  if (hooks == NULL || hooks->version != 1 || hooks->size < sizeof (*hooks) ||
+      hooks->patch_code == NULL || hooks->protect == NULL)
+    return;
+
+  gum_jailbreak_memory_hooks = hooks;
+#endif
 }
 
 void
 _gum_memory_backend_deinit (void)
 {
+  gum_jailbreak_memory_hooks = NULL;
 }
 
 guint
@@ -266,11 +301,12 @@ gum_memory_is_readable (gconstpointer address,
 }
 
 gboolean
-gum_memory_query_protection (gconstpointer address,
-                             GumPageProtection * prot)
+gum_memory_query_region (gconstpointer address,
+                         GumMemoryRange * range,
+                         GumPageProtection * prot)
 {
-  return gum_darwin_query_protection (mach_task_self (), GUM_ADDRESS (address),
-      prot);
+  return gum_darwin_query_region (mach_task_self (), GUM_ADDRESS (address),
+      range, prot);
 }
 
 guint8 *
@@ -373,7 +409,24 @@ gum_darwin_write (mach_port_t task,
 gboolean
 gum_memory_can_remap_writable (void)
 {
+  if (gum_jailbreak_memory_hooks != NULL)
+    return FALSE;
+
   return gum_darwin_is_debugger_mapping_enforced ();
+}
+
+gboolean
+_gum_darwin_has_jailbreak_memory_hooks (void)
+{
+  return gum_jailbreak_memory_hooks != NULL;
+}
+
+kern_return_t
+_gum_darwin_jailbreak_patch_code (gpointer address,
+                                  gconstpointer data,
+                                  gsize size)
+{
+  return gum_jailbreak_memory_hooks->patch_code (address, data, size);
 }
 
 gpointer
@@ -398,7 +451,7 @@ gum_memory_try_remap_writable_pages (gpointer first_page,
     return NULL;
   }
 
-  if (gum_mach_vm_protect (task, writable_address, size, FALSE,
+  if (gum_protect_with_copy_fallback (task, writable_address, size,
       VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS)
   {
     mach_vm_deallocate (task, writable_address, size);
@@ -437,6 +490,12 @@ gum_mach_vm_protect (vm_map_t target_task,
                      boolean_t set_maximum,
                      vm_prot_t new_protection)
 {
+  if (gum_jailbreak_memory_hooks != NULL)
+  {
+    return gum_jailbreak_memory_hooks->protect (target_task, address, size,
+        set_maximum, new_protection);
+  }
+
 #if defined (HAVE_ARM)
   kern_return_t result;
   guint32 args[] = {
@@ -505,6 +564,25 @@ gum_mach_vm_protect (vm_map_t target_task,
 #endif
 }
 
+static kern_return_t
+gum_protect_with_copy_fallback (vm_map_t task,
+                                mach_vm_address_t address,
+                                mach_vm_size_t size,
+                                vm_prot_t prot)
+{
+  kern_return_t kr;
+
+  kr = gum_mach_vm_protect (task, address, size, FALSE, prot);
+
+  if (kr != KERN_SUCCESS && (prot & VM_PROT_WRITE) != 0)
+  {
+    kr = gum_mach_vm_protect (task, address, size, FALSE,
+        prot | VM_PROT_COPY);
+  }
+
+  return kr;
+}
+
 gboolean
 gum_try_mprotect (gpointer address,
                   gsize size,
@@ -525,8 +603,8 @@ gum_try_mprotect (gpointer address,
       (1 + ((address + size - 1 - aligned_address) / page_size)) * page_size;
   mach_prot = gum_page_protection_to_mach (prot);
 
-  kr = gum_mach_vm_protect (mach_task_self (),
-      GPOINTER_TO_SIZE (aligned_address), aligned_size, FALSE, mach_prot);
+  kr = gum_protect_with_copy_fallback (mach_task_self (),
+      GPOINTER_TO_SIZE (aligned_address), aligned_size, mach_prot);
 
   return kr == KERN_SUCCESS;
 }
@@ -776,7 +854,7 @@ gum_page_protection_to_mach (GumPageProtection prot)
   if ((prot & GUM_PAGE_READ) != 0)
     mach_prot |= VM_PROT_READ;
   if ((prot & GUM_PAGE_WRITE) != 0)
-    mach_prot |= VM_PROT_WRITE | VM_PROT_COPY;
+    mach_prot |= VM_PROT_WRITE;
   if ((prot & GUM_PAGE_EXECUTE) != 0)
     mach_prot |= VM_PROT_EXECUTE;
 

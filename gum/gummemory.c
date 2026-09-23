@@ -5,11 +5,16 @@
  * Copyright (C) 2026 Håvard Sørbø <havard@hsorbo.no>
  * Copyright (C) 2026 Ricardo Marques <marquessricardo@gmail.com>
  * Copyright (C) 2026 IPMegladon <ipmegladon@gmail.com>
+ * Copyright (C) 2026 Paul de Terrasson de Montleau <devnoname120@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
 #include "gummemory.h"
+
+#ifdef HAVE_PROSPERO
+# include "gummemory-prospero.h"
+#endif
 
 #include "gumcloak-priv.h"
 #include "gumcodesegment.h"
@@ -158,6 +163,11 @@ static gboolean gum_memory_patch_code_pages_via_mprotect (
 static gboolean gum_memory_patch_code_pages_via_code_segment (
     GPtrArray * sorted_addresses, gboolean coalesce, gsize page_size,
     GumMemoryPatchPagesApplyFunc apply, gpointer apply_data);
+#ifdef HAVE_DARWIN
+static gboolean gum_memory_patch_code_pages_via_jailbreak (
+    GPtrArray * sorted_addresses, gboolean coalesce,
+    GumMemoryPatchPagesApplyFunc apply, gpointer apply_data);
+#endif
 static gboolean gum_maybe_suspend_thread (const GumThreadDetails * details,
     gpointer user_data);
 
@@ -352,6 +362,25 @@ gum_query_rwx_support (void)
 }
 
 /**
+ * gum_memory_query_protection:
+ * @address: address to query
+ * @prot: (out): return location for the page protection
+ *
+ * Queries the page protection in effect at @address. Use
+ * [func@Gum.memory_query_region] to also learn how far it extends.
+ *
+ * Returns: whether the query was successful
+ */
+gboolean
+gum_memory_query_protection (gconstpointer address,
+                             GumPageProtection * prot)
+{
+  GumMemoryRange range;
+
+  return gum_memory_query_region (address, &range, prot);
+}
+
+/**
  * gum_memory_patch_code:
  * @address: address to modify from
  * @size: number of bytes to modify
@@ -441,6 +470,17 @@ gum_memory_patch_code_pages (GPtrArray * sorted_addresses,
 {
   gsize page_size;
   gboolean rwx_supported;
+
+  if (sorted_addresses->len == 0)
+    return TRUE;
+
+#ifdef HAVE_DARWIN
+  if (_gum_darwin_has_jailbreak_memory_hooks ())
+  {
+    return gum_memory_patch_code_pages_via_jailbreak (sorted_addresses,
+        coalesce, apply, apply_data);
+  }
+#endif
 
   rwx_supported = gum_query_is_rwx_supported ();
   page_size = gum_query_page_size ();
@@ -939,6 +979,112 @@ gum_memory_patch_code_pages_via_code_segment (
 
   return TRUE;
 }
+
+#ifdef HAVE_DARWIN
+
+static gboolean
+gum_memory_patch_code_pages_via_jailbreak (GPtrArray * sorted_addresses,
+                                           gboolean coalesce,
+                                           GumMemoryPatchPagesApplyFunc apply,
+                                           gpointer apply_data)
+{
+  gboolean success = FALSE;
+  gsize page_size, size;
+  guint8 * scratch, * pristine;
+  guint i;
+  GumSuspendOperation suspend_op = { 0, };
+
+  page_size = gum_query_page_size ();
+  size = sorted_addresses->len * page_size;
+
+  scratch = g_malloc (2 * size);
+  pristine = scratch + size;
+
+  for (i = 0; i != sorted_addresses->len; i++)
+  {
+    memcpy (pristine + i * page_size,
+        g_ptr_array_index (sorted_addresses, i), page_size);
+  }
+  memcpy (scratch, pristine, size);
+
+  for (i = 0; i != sorted_addresses->len;)
+  {
+    guint first, count;
+    guint8 * target;
+
+    first = i++;
+    target = g_ptr_array_index (sorted_addresses, first);
+    if (coalesce)
+    {
+      while (i != sorted_addresses->len &&
+          g_ptr_array_index (sorted_addresses, i) ==
+              target + (i - first) * page_size)
+        i++;
+    }
+    count = i - first;
+
+    apply (scratch + first * page_size, target, count, apply_data);
+  }
+
+  gum_metal_array_init (&suspend_op.suspended_threads, sizeof (GumThreadId));
+  suspend_op.current_thread_id = gum_process_get_current_thread_id ();
+  _gum_process_enumerate_threads (gum_maybe_suspend_thread, &suspend_op,
+      GUM_THREAD_FLAGS_NONE);
+
+  for (i = 0; i != sorted_addresses->len; i++)
+  {
+    guint8 * target, * source, * original;
+    gsize offset;
+
+    target = g_ptr_array_index (sorted_addresses, i);
+    source = scratch + i * page_size;
+    original = pristine + i * page_size;
+
+    for (offset = 0; offset != page_size;)
+    {
+      const gsize arm64_insn_size = 4;
+      gsize start;
+      kern_return_t kr;
+
+      if (memcmp (source + offset, original + offset, arm64_insn_size) == 0)
+      {
+        offset += arm64_insn_size;
+        continue;
+      }
+
+      start = offset;
+      do
+      {
+        offset += arm64_insn_size;
+      }
+      while (offset != page_size &&
+          memcmp (source + offset, original + offset, arm64_insn_size) != 0);
+
+      kr = _gum_darwin_jailbreak_patch_code (target + start, source + start,
+          offset - start);
+      if (kr != KERN_SUCCESS)
+        goto beach;
+    }
+  }
+
+  success = TRUE;
+
+beach:
+  for (i = 0; i != suspend_op.suspended_threads.length; i++)
+  {
+    GumThreadId * id = gum_metal_array_element_at (
+        &suspend_op.suspended_threads, i);
+
+    gum_thread_resume (*id, NULL);
+    mach_port_mod_refs (mach_task_self (), *id, MACH_PORT_RIGHT_SEND, -1);
+  }
+  gum_metal_array_free (&suspend_op.suspended_threads);
+  g_free (scratch);
+
+  return success;
+}
+
+#endif
 
 static gboolean
 gum_maybe_suspend_thread (const GumThreadDetails * details,
@@ -1870,10 +2016,7 @@ void
 gum_ensure_code_readable (gconstpointer address,
                           gsize size)
 {
-  /*
-   * We will make this more generic once it's needed on other OSes.
-   */
-#ifdef HAVE_ANDROID
+#if defined (HAVE_ANDROID)
   gsize page_size;
   gconstpointer start_page, end_page, cur_page;
 
@@ -1913,6 +2056,8 @@ gum_ensure_code_readable (gconstpointer address,
   }
 
   G_UNLOCK (gum_softened_code_pages);
+#elif defined (HAVE_PROSPERO)
+  _gum_prospero_make_code_readable (address, size);
 #endif
 }
 

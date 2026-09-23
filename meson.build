@@ -113,6 +113,8 @@ else
   host_cpu_mode = '32'
 endif
 
+host_is_prospero = host_os_family == 'freebsd' and cc.get_define('__PROSPERO__') != ''
+
 if host_os_family == 'windows'
   host_executable_format = 'pe'
 elif host_os_family == 'darwin'
@@ -188,6 +190,10 @@ if host_os_family != 'none'
   if host_os != host_os_family
     cdata.set('HAVE_' + host_os.to_upper(), 1)
   endif
+endif
+
+if host_is_prospero
+  cdata.set('HAVE_PROSPERO', 1)
 endif
 
 cpu_defines = [
@@ -539,6 +545,10 @@ if host_os == 'android'
   extra_libs_private += ['-llog']
 endif
 
+if host_is_prospero
+  extra_deps += cc.find_library('unwind')
+endif
+
 if host_os_family in ['linux', 'freebsd', 'qnx']
   libunwind_dep = dependency('libunwind', default_options: [
     'default_library=static',
@@ -768,6 +778,9 @@ endif
 
 if host_os_family == 'freebsd'
   gum_incdirs += include_directories('gum' / 'backend-freebsd' / 'include')
+  if host_is_prospero
+    gum_incdirs += include_directories('gum' / 'backend-prospero')
+  endif
 endif
 
 if host_os_family == 'qnx'

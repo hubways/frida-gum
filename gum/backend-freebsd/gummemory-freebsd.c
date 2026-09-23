@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2022-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2025 Francesco Tamagni <mrmacete@protonmail.ch>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -12,21 +12,27 @@
 #include "valgrind.h"
 
 #include <sys/mman.h>
+#ifdef HAVE_PROSPERO
+# include <unistd.h>
+# include <ps5/kernel.h>
+#endif
 
-typedef struct _GumFindRangeProtContext GumFindRangeProtContext;
+typedef struct _GumFindRangeContext GumFindRangeContext;
 
-struct _GumFindRangeProtContext
+struct _GumFindRangeContext
 {
   GumAddress address;
 
   gboolean found;
+  GumMemoryRange range;
   GumPageProtection protection;
 };
 
 static gboolean gum_memory_get_protection (gconstpointer address, gsize n,
     gsize * size, GumPageProtection * prot);
-static gboolean gum_store_protection_if_containing_address (
-    const GumRangeDetails * details, GumFindRangeProtContext * ctx);
+static gboolean gum_store_range_if_containing_address (
+    const GumRangeDetails * details, GumFindRangeContext * ctx);
+static gint gum_mprotect_pages (gpointer address, gsize size, gint prot);
 
 gboolean
 gum_memory_is_readable (gconstpointer address,
@@ -55,15 +61,25 @@ gum_memory_is_writable (gconstpointer address,
 }
 
 gboolean
-gum_memory_query_protection (gconstpointer address,
-                             GumPageProtection * prot)
+gum_memory_query_region (gconstpointer address,
+                         GumMemoryRange * range,
+                         GumPageProtection * prot)
 {
-  gsize size;
+  GumFindRangeContext ctx;
 
-  if (!gum_memory_get_protection (address, 1, &size, prot))
+  ctx.address = GUM_ADDRESS (address);
+  ctx.found = FALSE;
+
+  _gum_process_enumerate_ranges (GUM_PAGE_NO_ACCESS,
+      (GumFoundRangeFunc) gum_store_range_if_containing_address, &ctx);
+
+  if (!ctx.found)
     return FALSE;
 
-  return size >= 1;
+  *range = ctx.range;
+  *prot = ctx.protection;
+
+  return TRUE;
 }
 
 guint8 *
@@ -144,7 +160,7 @@ gum_try_mprotect (gpointer address,
       (1 + ((address + size - 1 - aligned_address) / page_size)) * page_size;
   posix_prot = _gum_page_protection_to_posix (prot);
 
-  result = mprotect (aligned_address, aligned_size, posix_prot);
+  result = gum_mprotect_pages (aligned_address, aligned_size, posix_prot);
 
   return result == 0;
 }
@@ -165,7 +181,7 @@ gum_memory_get_protection (gconstpointer address,
                            gsize * size,
                            GumPageProtection * prot)
 {
-  GumFindRangeProtContext ctx;
+  GumFindRangeContext ctx;
 
   if (size == NULL || prot == NULL)
   {
@@ -220,7 +236,7 @@ gum_memory_get_protection (gconstpointer address,
   ctx.found = FALSE;
 
   _gum_process_enumerate_ranges (GUM_PAGE_NO_ACCESS,
-      (GumFoundRangeFunc) gum_store_protection_if_containing_address, &ctx);
+      (GumFoundRangeFunc) gum_store_range_if_containing_address, &ctx);
 
   if (ctx.found)
   {
@@ -232,18 +248,31 @@ gum_memory_get_protection (gconstpointer address,
 }
 
 static gboolean
-gum_store_protection_if_containing_address (const GumRangeDetails * details,
-                                            GumFindRangeProtContext * ctx)
+gum_store_range_if_containing_address (const GumRangeDetails * details,
+                                       GumFindRangeContext * ctx)
 {
   gboolean proceed = TRUE;
 
   if (GUM_MEMORY_RANGE_INCLUDES (details->range, ctx->address))
   {
     ctx->found = TRUE;
+    ctx->range = *details->range;
     ctx->protection = details->protection;
 
     proceed = FALSE;
   }
 
   return proceed;
+}
+
+static gint
+gum_mprotect_pages (gpointer address,
+                    gsize size,
+                    gint prot)
+{
+#ifdef HAVE_PROSPERO
+  return kernel_mprotect (getpid (), GPOINTER_TO_SIZE (address), size, prot);
+#else
+  return mprotect (address, size, prot);
+#endif
 }
