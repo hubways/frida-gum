@@ -177,9 +177,12 @@ namespace Gum {
 
 	[CCode (cprefix = "GUM_ATTACH_")]
 	public enum AttachReturn {
-		OK		  =  0,
-		WRONG_SIGNATURE	  = -1,
-		ALREADY_ATTACHED  = -2
+		OK,
+		INVALID_INSTRUCTION,
+		WRONG_SIGNATURE,
+		ALREADY_ATTACHED,
+		POLICY_VIOLATION,
+		WRONG_TYPE,
 	}
 
 	[CCode (has_type_id = false)]
@@ -197,9 +200,12 @@ namespace Gum {
 
 	[CCode (cprefix = "GUM_REPLACE_")]
 	public enum ReplaceReturn {
-		OK		  =  0,
-		WRONG_SIGNATURE	  = -1,
-		ALREADY_REPLACED  = -2
+		OK,
+		INVALID_INSTRUCTION,
+		WRONG_SIGNATURE,
+		ALREADY_REPLACED,
+		POLICY_VIOLATION,
+		WRONG_TYPE,
 	}
 
 	[CCode (has_type_id = false)]
@@ -2492,6 +2498,8 @@ namespace Gum {
 
 		public bool put_xpaci_reg (Gum.Arm64Reg reg);
 
+		public void put_svc_imm (uint16 imm);
+
 		public void put_nop ();
 		public void put_brk_imm (uint16 imm);
 
@@ -2532,7 +2540,8 @@ namespace Gum {
 		public bool write_one ();
 		public void write_all ();
 
-		public static bool can_relocate (void * address, uint min_bytes, Gum.RelocationScenario scenario, out uint maximum = null, out Gum.Arm64Reg available_scratch_reg = null);
+		public static bool can_relocate (void * address, uint min_bytes, Gum.RelocationScenario scenario, Gum.RelocationPolicy policy, out uint maximum = null, out Gum.Arm64Reg available_scratch_reg = null);
+		public static bool can_relocate_within (void * address, Gum.Address pc, uint min_bytes, Gum.RelocationScenario scenario, Gum.RelocationPolicy policy, Gum.MemoryRange? code_range, out uint maximum = null, out Gum.Arm64Reg available_scratch_reg = null);
 		public static uint relocate (void * from, uint min_bytes, void * to);
 	}
 

@@ -2,6 +2,7 @@
  * Copyright (C) 2008-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
  * Copyright (C) 2026 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2026 Jiska Classen <jclassen@seemoo.tu-darmstadt.de>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -9,6 +10,13 @@
 #include "interceptor-fixture.c"
 
 #include <setjmp.h>
+#ifdef HAVE_WINDOWS
+# include <windows.h>
+# ifdef _MSC_VER
+#  define GUM_TEST_HAVE_SEH
+#  define GUM_TEST_SEH_EXCEPTION_CODE 0xe0006d73
+# endif
+#endif
 #if defined (HAVE_LINUX) && defined (__GLIBC__)
 # define GUM_TEST_HAVE_FIBERS
 # include <sys/mman.h>
@@ -42,6 +50,9 @@ TESTLIST_BEGIN (interceptor)
   TESTENTRY (attach_to_recursive_function)
   TESTENTRY (attach_to_special_function)
   TESTENTRY (longjmp_reaps_skipped_leave)
+#ifdef GUM_TEST_HAVE_SEH
+  TESTENTRY (seh_exception_reaps_skipped_leave)
+#endif
 #ifdef GUM_TEST_HAVE_FIBERS
   TESTENTRY (stackful_coroutine_does_not_reap_live_frames)
   TESTENTRY (stackful_coroutine_same_function)
@@ -83,6 +94,11 @@ TESTLIST_BEGIN (interceptor)
 #ifdef HAVE_I386
   TESTENTRY (ibt_landing_pad_survives_attach)
 #endif
+#ifdef HAVE_ARM64
+  TESTENTRY (attach_to_busy_ip_registers)
+  TESTENTRY (attach_with_exits_needing_different_regs)
+  TESTENTRY (attach_with_ip_registers_live_across_resume)
+#endif
 
   TESTENTRY (i_can_has_replaceability)
   TESTENTRY (already_replaced)
@@ -108,6 +124,14 @@ static GString * gum_test_unwind_log = NULL;
 static jmp_buf gum_test_longjmp_buf;
 static void gum_test_longjmp_outer (void);
 static void gum_test_longjmp_inner (void);
+#ifdef GUM_TEST_HAVE_SEH
+static gboolean gum_test_seh_unwinder_is_emulated (void);
+static void gum_test_seh_outer (void);
+static void gum_test_seh_inner (void);
+#endif
+#ifdef HAVE_ARM64
+static gsize gum_return_1337 (void);
+#endif
 #ifdef GUM_TEST_HAVE_FIBERS
 static ucontext_t gum_test_uctx_main;
 static ucontext_t gum_test_uctx_a;
@@ -207,6 +231,70 @@ gum_test_longjmp_inner (void)
   g_string_append_c (gum_test_unwind_log, 'i');
   longjmp (gum_test_longjmp_buf, 1);
 }
+
+#ifdef GUM_TEST_HAVE_SEH
+
+TESTCASE (seh_exception_reaps_skipped_leave)
+{
+  if (gum_test_seh_unwinder_is_emulated ())
+  {
+    g_print ("<skipping, unwinder is emulated> ");
+    return;
+  }
+
+  gum_test_unwind_log = fixture->result;
+
+  interceptor_fixture_attach (fixture, 0, gum_test_seh_outer, '>', '<');
+  interceptor_fixture_attach (fixture, 1, gum_test_seh_inner, '[', ']');
+
+  gum_test_seh_outer ();
+
+  g_assert_cmpstr (fixture->result->str, ==, ">o[iO<");
+}
+
+static gboolean
+gum_test_seh_unwinder_is_emulated (void)
+{
+#if defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 8
+  BOOL (WINAPI * is_wow64_process2) (HANDLE process, USHORT * process_machine,
+      USHORT * native_machine);
+  USHORT process_machine, native_machine;
+
+  is_wow64_process2 = (gpointer) GetProcAddress (
+      GetModuleHandleW (L"kernel32.dll"), "IsWow64Process2");
+  if (is_wow64_process2 == NULL)
+    return FALSE;
+
+  is_wow64_process2 (GetCurrentProcess (), &process_machine, &native_machine);
+
+  return native_machine != IMAGE_FILE_MACHINE_AMD64;
+#else
+  return FALSE;
+#endif
+}
+
+GUM_HOOK_TARGET static void
+gum_test_seh_outer (void)
+{
+  g_string_append_c (gum_test_unwind_log, 'o');
+  __try
+  {
+    gum_test_seh_inner ();
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER)
+  {
+  }
+  g_string_append_c (gum_test_unwind_log, 'O');
+}
+
+GUM_HOOK_TARGET static void
+gum_test_seh_inner (void)
+{
+  g_string_append_c (gum_test_unwind_log, 'i');
+  RaiseException (GUM_TEST_SEH_EXCEPTION_CODE, 0, 0, NULL);
+}
+
+#endif
 
 #ifdef GUM_TEST_HAVE_FIBERS
 
@@ -837,6 +925,121 @@ TESTCASE (ibt_landing_pad_survives_attach)
   interceptor_fixture_detach (fixture, 0);
 
   gum_memory_free (code, page_size);
+}
+
+#endif
+
+#ifdef HAVE_ARM64
+
+TESTCASE (attach_to_busy_ip_registers)
+{
+  gsize page_size;
+  guint8 * code;
+  GumArm64Writer cw;
+  gint (* target) (gint arg);
+
+  page_size = gum_query_page_size ();
+  code = gum_memory_allocate (NULL, page_size, page_size, GUM_PAGE_RW);
+  gum_arm64_writer_init (&cw, code);
+  gum_arm64_writer_put_add_reg_reg_imm (&cw, ARM64_REG_X16, ARM64_REG_X0, 1);
+  gum_arm64_writer_put_add_reg_reg_imm (&cw, ARM64_REG_X17, ARM64_REG_X16, 2);
+  gum_arm64_writer_put_add_reg_reg_imm (&cw, ARM64_REG_X0, ARM64_REG_X17, 3);
+  gum_arm64_writer_put_nop (&cw);
+  gum_arm64_writer_put_ret (&cw);
+  gum_arm64_writer_clear (&cw);
+  gum_mprotect (code, page_size, GUM_PAGE_RX);
+  target = (gint (*) (gint)) code;
+
+  g_assert_cmpint (target (1), ==, 7);
+
+  interceptor_fixture_attach (fixture, 0, target, '>', '<');
+
+  g_assert_cmpint (target (1), ==, 7);
+  g_assert_cmpstr (fixture->result->str, ==, "><");
+
+  interceptor_fixture_detach (fixture, 0);
+
+  gum_memory_free (code, page_size);
+}
+
+TESTCASE (attach_with_exits_needing_different_regs)
+{
+  gsize page_size;
+  guint8 * code;
+  GumArm64Writer cw;
+  const gchar * is_null = "is_null";
+  gsize (* target) (gsize base, const gsize * values, gsize fallback);
+  const gsize present[] = { 0, 0, 5 };
+  const gsize absent[] = { 0, 0, 0 };
+
+  page_size = gum_query_page_size ();
+  code = gum_memory_allocate (NULL, page_size, page_size, GUM_PAGE_RW);
+  gum_arm64_writer_init (&cw, code);
+  gum_arm64_writer_put_mov_reg_reg (&cw, ARM64_REG_X17, ARM64_REG_X1);
+  gum_arm64_writer_put_ldr_reg_reg_offset_mode (&cw, ARM64_REG_X16,
+      ARM64_REG_X17, 16, GUM_INDEX_PRE_ADJUST);
+  gum_arm64_writer_put_cbz_reg_label (&cw, ARM64_REG_X16, is_null);
+  gum_arm64_writer_put_add_reg_reg_imm (&cw, ARM64_REG_X16, ARM64_REG_X16, 1);
+  gum_arm64_writer_put_mov_reg_reg (&cw, ARM64_REG_X17, ARM64_REG_X16);
+  gum_arm64_writer_put_add_reg_reg_reg (&cw, ARM64_REG_X0, ARM64_REG_X0,
+      ARM64_REG_X17);
+  gum_arm64_writer_put_ret (&cw);
+  gum_arm64_writer_put_label (&cw, is_null);
+  gum_arm64_writer_put_mov_reg_reg (&cw, ARM64_REG_X8, ARM64_REG_X2);
+  gum_arm64_writer_put_add_reg_reg_reg (&cw, ARM64_REG_X0, ARM64_REG_X0,
+      ARM64_REG_X8);
+  gum_arm64_writer_put_ret (&cw);
+  gum_arm64_writer_clear (&cw);
+  gum_mprotect (code, page_size, GUM_PAGE_RX);
+  target = (gsize (*) (gsize, const gsize *, gsize)) code;
+
+  interceptor_fixture_attach (fixture, 0, target, '>', '<');
+
+  g_assert_cmpuint (target (100, present, 7), ==, 106);
+  g_assert_cmpuint (target (100, absent, 7), ==, 107);
+  g_assert_cmpstr (fixture->result->str, ==, "><><");
+
+  interceptor_fixture_detach (fixture, 0);
+
+  gum_memory_free (code, page_size);
+}
+
+TESTCASE (attach_with_ip_registers_live_across_resume)
+{
+  gsize page_size;
+  guint8 * code;
+  GumArm64Writer cw;
+  gsize (* target) (gpointer * slot);
+  gpointer slot;
+
+  page_size = gum_query_page_size ();
+  code = gum_memory_allocate (NULL, page_size, page_size, GUM_PAGE_RW);
+  gum_arm64_writer_init (&cw, code);
+  gum_arm64_writer_put_mov_reg_reg (&cw, ARM64_REG_X17, ARM64_REG_X0);
+  gum_arm64_writer_put_ldr_reg_reg_offset (&cw, ARM64_REG_X16, ARM64_REG_X17,
+      0);
+  gum_arm64_writer_put_add_reg_reg_imm (&cw, ARM64_REG_X17, ARM64_REG_X17, 8);
+  gum_arm64_writer_put_nop (&cw);
+  gum_arm64_writer_put_br_reg_no_auth (&cw, ARM64_REG_X16);
+  gum_arm64_writer_clear (&cw);
+  gum_mprotect (code, page_size, GUM_PAGE_RX);
+  target = (gsize (*) (gpointer *)) code;
+  slot = gum_strip_code_pointer (GUM_FUNCPTR_TO_POINTER (gum_return_1337));
+
+  interceptor_fixture_attach (fixture, 0, target, '>', '<');
+
+  g_assert_cmpuint (target (&slot), ==, 1337);
+  g_assert_cmpstr (fixture->result->str, ==, "><");
+
+  interceptor_fixture_detach (fixture, 0);
+
+  gum_memory_free (code, page_size);
+}
+
+static gsize
+gum_return_1337 (void)
+{
+  return 1337;
 }
 
 #endif
