@@ -8,7 +8,13 @@
 /**
  * GumSwiftApiResolver:
  *
- * Resolves APIs by searching currently loaded Swift modules.
+ * Resolves APIs by searching currently loaded Swift modules. Functions are
+ * matched by demangled name, e.g. `functions:*!Swift.String.hasPrefix*`.
+ * Nominal types and protocols are matched by full name, e.g.
+ * `types:*!Swift.Int` and `protocols:libswiftCore.dylib!Swift.*`, where each
+ * match is the address of the context descriptor. Protocol conformances are
+ * matched by type and protocol name, e.g. `conformances:Swift.Int!Swift.*`,
+ * where each match is the address of the conformance descriptor.
  *
  * See [iface@Gum.ApiResolver] for more information.
  */
@@ -48,11 +54,39 @@
 #define GUM_METHOD_DESCRIPTOR_IS_ASYNC(desc) \
     (((desc)->flags & GUM_METHOD_ASYNC) != 0)
 
+#define GUM_CONFORMANCE_FLAGS_TYPE_REFERENCE_KIND(flags) \
+    (((flags) >> 3) & 7)
+
+#define GUM_PROTOCOL_RECORD_RESERVED_BIT 2
+
+#if defined (HAVE_WINDOWS)
+# define GUM_SWIFT_CORE_MODULE "swiftCore.dll"
+# define GUM_SWIFT_TYPES_SECTION ".sw5tymd"
+# define GUM_SWIFT_TYPES2_SECTION ".sw5tym2"
+# define GUM_SWIFT_PROTOCOLS_SECTION ".sw5prt"
+# define GUM_SWIFT_CONFORMANCES_SECTION ".sw5prtc"
+#elif defined (HAVE_DARWIN)
+# define GUM_SWIFT_CORE_MODULE "libswiftCore.dylib"
+# define GUM_SWIFT_TYPES_SECTION "__swift5_types"
+# define GUM_SWIFT_TYPES2_SECTION "__swift5_types2"
+# define GUM_SWIFT_PROTOCOLS_SECTION "__swift5_protos"
+# define GUM_SWIFT_CONFORMANCES_SECTION "__swift5_proto"
+#else
+# define GUM_SWIFT_CORE_MODULE "libswiftCore.so"
+# define GUM_SWIFT_TYPES_SECTION "swift5_type_metadata"
+# define GUM_SWIFT_TYPES2_SECTION "swift5_type_metadata_2"
+# define GUM_SWIFT_PROTOCOLS_SECTION "swift5_protocols"
+# define GUM_SWIFT_CONFORMANCES_SECTION "swift5_protocol_conformances"
+#endif
+
 #define GUM_ALIGN(ptr, type) \
     GUM_ALIGN_POINTER (type *, ptr, G_ALIGNOF (type))
 
 typedef struct _GumModuleMetadata GumModuleMetadata;
 typedef struct _GumFunctionMetadata GumFunctionMetadata;
+typedef struct _GumDescriptorMetadata GumDescriptorMetadata;
+typedef struct _GumConformanceMetadata GumConformanceMetadata;
+typedef const gchar * (* GumClassGetName) (gpointer klass);
 typedef gchar * (* GumSwiftDemangle) (const gchar * mangled_name,
     gsize mangled_name_length, gchar * output_buffer,
     gsize * output_buffer_size, guint32 flags);
@@ -65,6 +99,10 @@ typedef struct _GumContextDescriptor GumContextDescriptor;
 typedef struct _GumModuleContextDescriptor GumModuleContextDescriptor;
 typedef struct _GumExtensionContextDescriptor GumExtensionContextDescriptor;
 typedef struct _GumTypeContextDescriptor GumTypeContextDescriptor;
+typedef struct _GumProtocolDescriptor GumProtocolDescriptor;
+typedef struct _GumProtocolConformanceDescriptor
+    GumProtocolConformanceDescriptor;
+typedef guint GumTypeReferenceKind;
 typedef struct _GumClassDescriptor GumClassDescriptor;
 typedef struct _GumGenericContextDescriptorHeader
     GumGenericContextDescriptorHeader;
@@ -97,6 +135,10 @@ struct _GumSwiftApiResolver
 
   GHashTable * modules;
   GumModuleMap * all_modules;
+  GHashTable * context_names;
+
+  GumSwiftDemangle swift_demangle;
+  GumLibcFreeFunc libc_free;
 };
 
 struct _GumModuleMetadata
@@ -107,6 +149,9 @@ struct _GumModuleMetadata
 
   GArray * functions;
   GHashTable * vtables;
+  GArray * types;
+  GArray * protocols;
+  GArray * conformances;
   GumSwiftApiResolver * resolver;
 };
 
@@ -114,6 +159,19 @@ struct _GumFunctionMetadata
 {
   gchar * name;
   GumAddress address;
+};
+
+struct _GumDescriptorMetadata
+{
+  const gchar * name;
+  GumAddress address;
+};
+
+struct _GumConformanceMetadata
+{
+  const gchar * type_name;
+  const gchar * protocol_name;
+  GumAddress descriptor;
 };
 
 struct _GumClass
@@ -193,6 +251,31 @@ struct _GumTypeContextDescriptor
   GumRelativeDirectPtr name;
   GumRelativeDirectPtr access_function_ptr;
   GumRelativeDirectPtr fields;
+};
+
+struct _GumProtocolDescriptor
+{
+  GumContextDescriptor context;
+  GumRelativeDirectPtr name;
+  guint32 num_requirements_in_signature;
+  guint32 num_requirements;
+  GumRelativeDirectPtr associated_type_names;
+};
+
+struct _GumProtocolConformanceDescriptor
+{
+  GumRelativeIndirectablePtr protocol;
+  GumRelativeDirectPtr type_ref;
+  GumRelativeDirectPtr witness_table_pattern;
+  guint32 flags;
+};
+
+enum _GumTypeReferenceKind
+{
+  GUM_TYPE_REFERENCE_DIRECT_TYPE_DESCRIPTOR,
+  GUM_TYPE_REFERENCE_INDIRECT_TYPE_DESCRIPTOR,
+  GUM_TYPE_REFERENCE_DIRECT_OBJC_CLASS_NAME,
+  GUM_TYPE_REFERENCE_INDIRECT_OBJC_CLASS,
 };
 
 struct _GumClassDescriptor
@@ -313,8 +396,23 @@ static void gum_swift_api_resolver_finalize (GObject * object);
 static void gum_swift_api_resolver_enumerate_matches (
     GumApiResolver * resolver, const gchar * query, GumFoundApiFunc func,
     gpointer user_data, GError ** error);
+static void gum_swift_api_resolver_enumerate_functions (
+    GumSwiftApiResolver * self, GPatternSpec * module_spec,
+    GPatternSpec * func_spec, gboolean ignore_case, GumFoundApiFunc func,
+    gpointer user_data);
+static void gum_swift_api_resolver_enumerate_descriptors (
+    GumSwiftApiResolver * self, GArray * (* get_descriptors) (
+    GumModuleMetadata * module), GPatternSpec * module_spec,
+    GPatternSpec * name_spec, gboolean ignore_case, GumFoundApiFunc func,
+    gpointer user_data);
+static void gum_swift_api_resolver_enumerate_conformances (
+    GumSwiftApiResolver * self, GPatternSpec * type_spec,
+    GPatternSpec * protocol_spec, gboolean ignore_case, GumFoundApiFunc func,
+    gpointer user_data);
 
 static void gum_module_metadata_unref (GumModuleMetadata * module);
+static gboolean gum_module_metadata_matches (GumModuleMetadata * self,
+    GPatternSpec * spec, gboolean ignore_case);
 static GArray * gum_module_metadata_get_functions (GumModuleMetadata * self);
 static gboolean gum_module_metadata_collect_export (
     const GumExportDetails * details, gpointer user_data);
@@ -330,18 +428,40 @@ static const gchar * gum_find_character_backwards (const gchar * starting_point,
     char needle, const gchar * start);
 #endif
 
+static GArray * gum_module_metadata_get_types (GumModuleMetadata * self);
+static gboolean gum_module_metadata_collect_type_section (
+    const GumSectionDetails * details, gpointer user_data);
+static GArray * gum_module_metadata_get_protocols (GumModuleMetadata * self);
+static gboolean gum_module_metadata_collect_protocol_section (
+    const GumSectionDetails * details, gpointer user_data);
+static void gum_module_metadata_add_descriptor (GumModuleMetadata * self,
+    GArray * descriptors, const GumContextDescriptor * cd);
+static GArray * gum_module_metadata_get_conformances (
+    GumModuleMetadata * self);
+static gboolean gum_module_metadata_collect_conformance_section (
+    const GumSectionDetails * details, gpointer user_data);
+static const gchar * gum_module_metadata_resolve_conforming_type_name (
+    GumModuleMetadata * self, const GumProtocolConformanceDescriptor * cd);
+static const gchar * gum_swift_api_resolver_get_context_name (
+    GumSwiftApiResolver * self, const GumContextDescriptor * cd);
+static gboolean gum_swift_api_resolver_ensure_demangler (
+    GumSwiftApiResolver * self);
+static gchar * gum_swift_api_resolver_demangle (GumSwiftApiResolver * self,
+    const gchar * name);
+
 static void gum_function_metadata_free (GumFunctionMetadata * function);
 
-static void gum_class_parse (GumClass * klass, const GumClassDescriptor * cd);
+static void gum_class_parse (GumSwiftApiResolver * resolver, GumClass * klass,
+    const GumClassDescriptor * cd);
 static void gum_class_clear (GumClass * klass);
 
 static gconstpointer gum_resolve_method_implementation (
     const GumRelativeDirectPtr * impl, const GumMethodDescriptor * method);
 
 static gchar * gum_compute_context_descriptor_name (
-    const GumContextDescriptor * cd);
-static void gum_append_demangled_context_name (GString * result,
-    const gchar * mangled_name);
+    GumSwiftApiResolver * resolver, const GumContextDescriptor * cd);
+static void gum_append_demangled_context_name (GumSwiftApiResolver * resolver,
+    GString * result, const gchar * mangled_name);
 
 static void gum_skip_generic_type_trailers (gconstpointer * trailer_ptr,
     const GumTypeContextDescriptor * t);
@@ -358,9 +478,8 @@ static gconstpointer gum_resolve_relative_indirect_ptr (
     const GumRelativeIndirectPtr * delta);
 static gconstpointer gum_resolve_relative_indirectable_ptr (
     const GumRelativeIndirectablePtr * delta);
-
-static gboolean gum_ensure_demangler (void);
-static gchar * gum_demangle (const gchar * name);
+static gconstpointer gum_resolve_protocol_record (
+    const GumRelativeIndirectablePtr * record);
 
 G_DEFINE_TYPE_EXTENDED (GumSwiftApiResolver,
                         gum_swift_api_resolver,
@@ -368,9 +487,6 @@ G_DEFINE_TYPE_EXTENDED (GumSwiftApiResolver,
                         0,
                         G_IMPLEMENT_INTERFACE (GUM_TYPE_API_RESOLVER,
                             gum_swift_api_resolver_iface_init))
-
-static GumSwiftDemangle gum_demangle_impl;
-static GumLibcFreeFunc gum_libc_free;
 
 static void
 gum_swift_api_resolver_class_init (GumSwiftApiResolverClass * klass)
@@ -396,13 +512,16 @@ gum_swift_api_resolver_init (GumSwiftApiResolver * self)
   GPtrArray * entries;
   guint i;
 
-  self->query_pattern = g_regex_new ("functions:(.+)!([^\\n\\r\\/]+)(\\/i)?",
+  self->query_pattern = g_regex_new (
+      "(functions|types|protocols|conformances):(.+)!([^\\n\\r\\/]+)(\\/i)?",
       0, 0, NULL);
 
   self->modules = g_hash_table_new_full (g_str_hash, g_str_equal, NULL,
       (GDestroyNotify) gum_module_metadata_unref);
 
   self->all_modules = gum_module_map_new ();
+
+  self->context_names = g_hash_table_new_full (NULL, NULL, NULL, g_free);
 
   entries = gum_module_map_get_values (self->all_modules);
   for (i = 0; i != entries->len; i++)
@@ -425,6 +544,9 @@ gum_swift_api_resolver_register_module (GumSwiftApiResolver * self,
   meta->functions = NULL;
   meta->vtables = g_hash_table_new_full (g_str_hash, g_str_equal,
       g_free, (GDestroyNotify) g_ptr_array_unref);
+  meta->types = NULL;
+  meta->protocols = NULL;
+  meta->conformances = NULL;
   meta->resolver = self;
 
   g_hash_table_insert (self->modules, (gpointer) gum_module_get_name (module),
@@ -443,6 +565,7 @@ gum_swift_api_resolver_dispose (GObject * object)
   g_clear_object (&self->all_modules);
 
   g_clear_pointer (&self->modules, g_hash_table_unref);
+  g_clear_pointer (&self->context_names, g_hash_table_unref);
 
   G_OBJECT_CLASS (gum_swift_api_resolver_parent_class)->dispose (object);
 }
@@ -481,14 +604,10 @@ gum_swift_api_resolver_enumerate_matches (GumApiResolver * resolver,
   GumSwiftApiResolver * self = GUM_SWIFT_API_RESOLVER (resolver);
   GMatchInfo * query_info;
   gboolean ignore_case;
-  gchar * module_query, * func_query;
+  gchar * collection, * module_query, * func_query;
   GPatternSpec * module_spec, * func_spec;
-  GHashTableIter module_iter;
-  GHashTable * seen_modules;
-  gboolean carry_on;
-  GumModuleMetadata * module;
 
-  if (!gum_ensure_demangler ())
+  if (!gum_swift_api_resolver_ensure_demangler (self))
     goto unsupported_runtime;
 
   g_regex_match (self->query_pattern, query, 0, &query_info);
@@ -497,8 +616,9 @@ gum_swift_api_resolver_enumerate_matches (GumApiResolver * resolver,
 
   ignore_case = g_match_info_get_match_count (query_info) >= 5;
 
-  module_query = g_match_info_fetch (query_info, 1);
-  func_query = g_match_info_fetch (query_info, 2);
+  collection = g_match_info_fetch (query_info, 1);
+  module_query = g_match_info_fetch (query_info, 2);
+  func_query = g_match_info_fetch (query_info, 3);
 
   g_match_info_free (query_info);
 
@@ -518,6 +638,66 @@ gum_swift_api_resolver_enumerate_matches (GumApiResolver * resolver,
   module_spec = g_pattern_spec_new (module_query);
   func_spec = g_pattern_spec_new (func_query);
 
+  if (strcmp (collection, "functions") == 0)
+  {
+    gum_swift_api_resolver_enumerate_functions (self, module_spec, func_spec,
+        ignore_case, func, user_data);
+  }
+  else if (strcmp (collection, "types") == 0)
+  {
+    gum_swift_api_resolver_enumerate_descriptors (self,
+        gum_module_metadata_get_types, module_spec, func_spec, ignore_case,
+        func, user_data);
+  }
+  else if (strcmp (collection, "protocols") == 0)
+  {
+    gum_swift_api_resolver_enumerate_descriptors (self,
+        gum_module_metadata_get_protocols, module_spec, func_spec,
+        ignore_case, func, user_data);
+  }
+  else
+  {
+    gum_swift_api_resolver_enumerate_conformances (self, module_spec,
+        func_spec, ignore_case, func, user_data);
+  }
+
+  g_pattern_spec_free (func_spec);
+  g_pattern_spec_free (module_spec);
+
+  g_free (func_query);
+  g_free (module_query);
+  g_free (collection);
+
+  return;
+
+unsupported_runtime:
+  {
+    g_set_error (error, GUM_ERROR, GUM_ERROR_NOT_SUPPORTED,
+        "unsupported Swift runtime; please file a bug");
+  }
+invalid_query:
+  {
+    g_set_error (error, GUM_ERROR, GUM_ERROR_INVALID_ARGUMENT,
+        "invalid query; format is: "
+        "functions:*someModule*!SomeClassPrefix*.*secret*(), "
+        "types:*!Swift.Int, protocols:*!Swift.Hashable, "
+        "or conformances:Swift.Int!Swift.*");
+  }
+}
+
+static void
+gum_swift_api_resolver_enumerate_functions (GumSwiftApiResolver * self,
+                                            GPatternSpec * module_spec,
+                                            GPatternSpec * func_spec,
+                                            gboolean ignore_case,
+                                            GumFoundApiFunc func,
+                                            gpointer user_data)
+{
+  GHashTableIter module_iter;
+  GHashTable * seen_modules;
+  gboolean carry_on;
+  GumModuleMetadata * module;
+
   g_hash_table_iter_init (&module_iter, self->modules);
   seen_modules = g_hash_table_new (NULL, NULL);
   carry_on = TRUE;
@@ -525,34 +705,15 @@ gum_swift_api_resolver_enumerate_matches (GumApiResolver * resolver,
   while (carry_on &&
       g_hash_table_iter_next (&module_iter, NULL, (gpointer *) &module))
   {
-    const gchar * module_name, * module_path;
-    const gchar * normalized_module_name, * normalized_module_path;
-    gchar * module_name_copy = NULL;
-    gchar * module_path_copy = NULL;
+    const gchar * module_path;
 
     if (g_hash_table_contains (seen_modules, module))
       continue;
     g_hash_table_add (seen_modules, module);
 
-    module_name = gum_module_get_name (module->module);
     module_path = gum_module_get_path (module->module);
 
-    if (ignore_case)
-    {
-      module_name_copy = g_utf8_strdown (module_name, -1);
-      normalized_module_name = module_name_copy;
-
-      module_path_copy = g_utf8_strdown (module_path, -1);
-      normalized_module_path = module_path_copy;
-    }
-    else
-    {
-      normalized_module_name = module_name;
-      normalized_module_path = module_path;
-    }
-
-    if (g_pattern_spec_match_string (module_spec, normalized_module_name) ||
-        g_pattern_spec_match_string (module_spec, normalized_module_path))
+    if (gum_module_metadata_matches (module, module_spec, ignore_case))
     {
       GArray * functions;
       guint i;
@@ -582,31 +743,148 @@ gum_swift_api_resolver_enumerate_matches (GumApiResolver * resolver,
         }
       }
     }
-
-    g_free (module_path_copy);
-    g_free (module_name_copy);
   }
 
   g_hash_table_unref (seen_modules);
+}
 
-  g_pattern_spec_free (func_spec);
-  g_pattern_spec_free (module_spec);
+static void
+gum_swift_api_resolver_enumerate_descriptors (
+    GumSwiftApiResolver * self,
+    GArray * (* get_descriptors) (GumModuleMetadata * module),
+    GPatternSpec * module_spec,
+    GPatternSpec * name_spec,
+    gboolean ignore_case,
+    GumFoundApiFunc func,
+    gpointer user_data)
+{
+  GHashTableIter module_iter;
+  GHashTable * seen_modules;
+  gboolean carry_on;
+  GumModuleMetadata * module;
 
-  g_free (func_query);
-  g_free (module_query);
+  g_hash_table_iter_init (&module_iter, self->modules);
+  seen_modules = g_hash_table_new (NULL, NULL);
+  carry_on = TRUE;
 
-  return;
-
-unsupported_runtime:
+  while (carry_on &&
+      g_hash_table_iter_next (&module_iter, NULL, (gpointer *) &module))
   {
-    g_set_error (error, GUM_ERROR, GUM_ERROR_NOT_SUPPORTED,
-        "unsupported Swift runtime; please file a bug");
+    const gchar * module_path;
+    GArray * descriptors;
+    guint i;
+
+    if (g_hash_table_contains (seen_modules, module))
+      continue;
+    g_hash_table_add (seen_modules, module);
+
+    if (!gum_module_metadata_matches (module, module_spec, ignore_case))
+      continue;
+
+    module_path = gum_module_get_path (module->module);
+
+    descriptors = get_descriptors (module);
+
+    for (i = 0; carry_on && i != descriptors->len; i++)
+    {
+      const GumDescriptorMetadata * d =
+          &g_array_index (descriptors, GumDescriptorMetadata, i);
+      const gchar * name = d->name;
+      gchar * name_copy = NULL;
+
+      if (ignore_case)
+      {
+        name_copy = g_utf8_strdown (name, -1);
+        name = name_copy;
+      }
+
+      if (g_pattern_spec_match_string (name_spec, name))
+      {
+        GumApiDetails details;
+
+        details.name = g_strconcat (module_path, "!", d->name, NULL);
+        details.address = d->address;
+        details.size = GUM_API_SIZE_NONE;
+
+        carry_on = func (&details, user_data);
+
+        g_free ((gpointer) details.name);
+      }
+
+      g_free (name_copy);
+    }
   }
-invalid_query:
+
+  g_hash_table_unref (seen_modules);
+}
+
+static void
+gum_swift_api_resolver_enumerate_conformances (GumSwiftApiResolver * self,
+                                               GPatternSpec * type_spec,
+                                               GPatternSpec * protocol_spec,
+                                               gboolean ignore_case,
+                                               GumFoundApiFunc func,
+                                               gpointer user_data)
+{
+  GHashTableIter module_iter;
+  GHashTable * seen_modules;
+  gboolean carry_on;
+  GumModuleMetadata * module;
+
+  g_hash_table_iter_init (&module_iter, self->modules);
+  seen_modules = g_hash_table_new (NULL, NULL);
+  carry_on = TRUE;
+
+  while (carry_on &&
+      g_hash_table_iter_next (&module_iter, NULL, (gpointer *) &module))
   {
-    g_set_error (error, GUM_ERROR, GUM_ERROR_INVALID_ARGUMENT,
-        "invalid query; format is: *someModule*!SomeClassPrefix*.*secret*()");
+    GArray * conformances;
+    guint i;
+
+    if (g_hash_table_contains (seen_modules, module))
+      continue;
+    g_hash_table_add (seen_modules, module);
+
+    conformances = gum_module_metadata_get_conformances (module);
+
+    for (i = 0; carry_on && i != conformances->len; i++)
+    {
+      const GumConformanceMetadata * c =
+          &g_array_index (conformances, GumConformanceMetadata, i);
+      const gchar * type_name = c->type_name;
+      const gchar * protocol_name = c->protocol_name;
+      gchar * type_name_copy = NULL;
+      gchar * protocol_name_copy = NULL;
+
+      if (ignore_case)
+      {
+        type_name_copy = g_utf8_strdown (type_name, -1);
+        type_name = type_name_copy;
+
+        protocol_name_copy = g_utf8_strdown (protocol_name, -1);
+        protocol_name = protocol_name_copy;
+      }
+
+      if (g_pattern_spec_match_string (type_spec, type_name) &&
+          g_pattern_spec_match_string (protocol_spec, protocol_name))
+      {
+        GumApiDetails details;
+
+        details.name = g_strconcat (c->type_name, "!", c->protocol_name, NULL);
+        details.address = c->descriptor;
+        details.size = GUM_API_SIZE_NONE;
+
+        carry_on = func (&details, user_data);
+
+        g_free ((gpointer) details.name);
+      }
+
+      g_free (protocol_name_copy);
+      g_free (type_name_copy);
+    }
   }
+
+  g_hash_table_unref (seen_modules);
 }
 
 static void
@@ -621,8 +899,48 @@ gum_module_metadata_unref (GumModuleMetadata * module)
     if (module->functions != NULL)
       g_array_unref (module->functions);
 
+    if (module->types != NULL)
+      g_array_unref (module->types);
+
+    if (module->protocols != NULL)
+      g_array_unref (module->protocols);
+
+    if (module->conformances != NULL)
+      g_array_unref (module->conformances);
+
     g_slice_free (GumModuleMetadata, module);
   }
+}
+
+static gboolean
+gum_module_metadata_matches (GumModuleMetadata * self,
+                             GPatternSpec * spec,
+                             gboolean ignore_case)
+{
+  const gchar * name, * path;
+  gchar * name_copy = NULL;
+  gchar * path_copy = NULL;
+  gboolean matches;
+
+  name = gum_module_get_name (self->module);
+  path = gum_module_get_path (self->module);
+
+  if (ignore_case)
+  {
+    name_copy = g_utf8_strdown (name, -1);
+    name = name_copy;
+
+    path_copy = g_utf8_strdown (path, -1);
+    path = path_copy;
+  }
+
+  matches = g_pattern_spec_match_string (spec, name) ||
+      g_pattern_spec_match_string (spec, path);
+
+  g_free (path_copy);
+  g_free (name_copy);
+
+  return matches;
 }
 
 static GArray *
@@ -654,7 +972,7 @@ gum_module_metadata_collect_export (const GumExportDetails * details,
   if (details->type != GUM_EXPORT_FUNCTION)
     goto skip;
 
-  name = gum_demangle (details->name);
+  name = gum_swift_api_resolver_demangle (self->resolver, details->name);
   if (name == NULL)
     goto skip;
 
@@ -677,7 +995,7 @@ gum_module_metadata_collect_section (const GumSectionDetails * details,
   gsize n, i;
   GumRelativeDirectPtr * types;
 
-  if (strcmp (details->name, "__swift5_types") != 0)
+  if (strcmp (details->name, GUM_SWIFT_TYPES_SECTION) != 0)
     return TRUE;
 
   n = details->size / sizeof (gint32);
@@ -688,6 +1006,9 @@ gum_module_metadata_collect_section (const GumSectionDetails * details,
   {
     const GumTypeContextDescriptor * type;
     guint32 descriptor_flags;
+
+    if (types[i] == 0)
+      continue;
 
     type = gum_resolve_relative_indirectable_ptr (&types[i]);
     descriptor_flags = type->context.flags;
@@ -712,7 +1033,7 @@ gum_module_metadata_collect_class (GumModuleMetadata * self,
   GumClass klass;
   guint i;
 
-  gum_class_parse (&klass, (const GumClassDescriptor *) type);
+  gum_class_parse (self->resolver, &klass, (const GumClassDescriptor *) type);
 
   if (klass.num_methods != 0)
   {
@@ -752,7 +1073,7 @@ gum_module_metadata_collect_class (GumModuleMetadata * self,
     GPtrArray * parent_vtable;
     GumFunctionMetadata func;
 
-    gum_class_parse (&parent_class,
+    gum_class_parse (self->resolver, &parent_class,
         gum_resolve_relative_indirectable_ptr (&od->class));
     parent_method = gum_resolve_relative_indirectable_ptr (&od->method);
     vtable_index = parent_method - parent_class.methods;
@@ -1029,6 +1350,273 @@ gum_module_metadata_maybe_ingest_thunk (GumModuleMetadata * self,
 
 #endif
 
+static GArray *
+gum_module_metadata_get_types (GumModuleMetadata * self)
+{
+  if (self->types == NULL)
+  {
+    self->types = g_array_new (FALSE, FALSE, sizeof (GumDescriptorMetadata));
+
+    gum_module_enumerate_sections (self->module,
+        gum_module_metadata_collect_type_section, self);
+  }
+
+  return self->types;
+}
+
+static gboolean
+gum_module_metadata_collect_type_section (const GumSectionDetails * details,
+                                          gpointer user_data)
+{
+  GumModuleMetadata * self = user_data;
+  gsize n, i;
+  const GumRelativeIndirectablePtr * records;
+
+  if (strcmp (details->name, GUM_SWIFT_TYPES_SECTION) != 0 &&
+      strcmp (details->name, GUM_SWIFT_TYPES2_SECTION) != 0)
+  {
+    return TRUE;
+  }
+
+  n = details->size / sizeof (gint32);
+
+  records = GSIZE_TO_POINTER (details->address);
+
+  for (i = 0; i != n; i++)
+  {
+    if (records[i] == 0)
+      continue;
+
+    gum_module_metadata_add_descriptor (self, self->types,
+        gum_resolve_relative_indirectable_ptr (&records[i]));
+  }
+
+  return TRUE;
+}
+
+static GArray *
+gum_module_metadata_get_protocols (GumModuleMetadata * self)
+{
+  if (self->protocols == NULL)
+  {
+    self->protocols =
+        g_array_new (FALSE, FALSE, sizeof (GumDescriptorMetadata));
+
+    gum_module_enumerate_sections (self->module,
+        gum_module_metadata_collect_protocol_section, self);
+  }
+
+  return self->protocols;
+}
+
+static gboolean
+gum_module_metadata_collect_protocol_section (
+    const GumSectionDetails * details,
+    gpointer user_data)
+{
+  GumModuleMetadata * self = user_data;
+  gsize n, i;
+  const GumRelativeIndirectablePtr * records;
+
+  if (strcmp (details->name, GUM_SWIFT_PROTOCOLS_SECTION) != 0)
+    return TRUE;
+
+  n = details->size / sizeof (gint32);
+
+  records = GSIZE_TO_POINTER (details->address);
+
+  for (i = 0; i != n; i++)
+  {
+    if (records[i] == 0)
+      continue;
+
+    gum_module_metadata_add_descriptor (self, self->protocols,
+        gum_resolve_protocol_record (&records[i]));
+  }
+
+  return TRUE;
+}
+
+static void
+gum_module_metadata_add_descriptor (GumModuleMetadata * self,
+                                    GArray * descriptors,
+                                    const GumContextDescriptor * cd)
+{
+  GumDescriptorMetadata d;
+
+  d.name = gum_swift_api_resolver_get_context_name (self->resolver, cd);
+  d.address = GUM_ADDRESS (cd);
+
+  g_array_append_val (descriptors, d);
+}
+
+static GArray *
+gum_module_metadata_get_conformances (GumModuleMetadata * self)
+{
+  if (self->conformances == NULL)
+  {
+    self->conformances =
+        g_array_new (FALSE, FALSE, sizeof (GumConformanceMetadata));
+
+    gum_module_enumerate_sections (self->module,
+        gum_module_metadata_collect_conformance_section, self);
+  }
+
+  return self->conformances;
+}
+
+static gboolean
+gum_module_metadata_collect_conformance_section (
+    const GumSectionDetails * details,
+    gpointer user_data)
+{
+  GumModuleMetadata * self = user_data;
+  gsize n, i;
+  const GumRelativeIndirectablePtr * records;
+
+  if (strcmp (details->name, GUM_SWIFT_CONFORMANCES_SECTION) != 0)
+    return TRUE;
+
+  n = details->size / sizeof (gint32);
+
+  records = GSIZE_TO_POINTER (details->address);
+
+  for (i = 0; i != n; i++)
+  {
+    const GumProtocolConformanceDescriptor * cd;
+    const GumContextDescriptor * protocol;
+    GumConformanceMetadata c;
+
+    if (records[i] == 0)
+      continue;
+
+    cd = gum_resolve_relative_indirectable_ptr (&records[i]);
+
+    protocol = gum_resolve_relative_indirectable_ptr (&cd->protocol);
+    if (protocol == NULL)
+      continue;
+
+    c.type_name = gum_module_metadata_resolve_conforming_type_name (self, cd);
+    if (c.type_name == NULL)
+      continue;
+    c.protocol_name =
+        gum_swift_api_resolver_get_context_name (self->resolver, protocol);
+    c.descriptor = GUM_ADDRESS (cd);
+
+    g_array_append_val (self->conformances, c);
+  }
+
+  return TRUE;
+}
+
+static const gchar *
+gum_module_metadata_resolve_conforming_type_name (
+    GumModuleMetadata * self,
+    const GumProtocolConformanceDescriptor * cd)
+{
+  static GumClassGetName class_get_name = NULL;
+  gconstpointer target;
+
+  target = gum_resolve_relative_direct_ptr (&cd->type_ref);
+
+  switch (GUM_CONFORMANCE_FLAGS_TYPE_REFERENCE_KIND (cd->flags))
+  {
+    case GUM_TYPE_REFERENCE_DIRECT_TYPE_DESCRIPTOR:
+      return gum_swift_api_resolver_get_context_name (self->resolver, target);
+    case GUM_TYPE_REFERENCE_INDIRECT_TYPE_DESCRIPTOR:
+      target = gum_strip_code_pointer (*(gpointer *) target);
+      if (target == NULL)
+        return NULL;
+      return gum_swift_api_resolver_get_context_name (self->resolver, target);
+    case GUM_TYPE_REFERENCE_DIRECT_OBJC_CLASS_NAME:
+      return target;
+    case GUM_TYPE_REFERENCE_INDIRECT_OBJC_CLASS:
+    {
+      gpointer klass;
+
+      if (class_get_name == NULL)
+      {
+        class_get_name = GUM_POINTER_TO_FUNCPTR (GumClassGetName,
+            gum_module_find_global_export_by_name ("class_getName"));
+      }
+
+      klass = gum_strip_code_pointer (*(gpointer *) target);
+      if (klass == NULL)
+        return NULL;
+
+      return class_get_name (klass);
+    }
+    default:
+      g_assert_not_reached ();
+  }
+
+  return NULL;
+}
+
+static const gchar *
+gum_swift_api_resolver_get_context_name (GumSwiftApiResolver * self,
+                                         const GumContextDescriptor * cd)
+{
+  gchar * name;
+
+  name = g_hash_table_lookup (self->context_names, cd);
+  if (name == NULL)
+  {
+    name = gum_compute_context_descriptor_name (self, cd);
+    g_hash_table_insert (self->context_names, (gpointer) cd, name);
+  }
+
+  return name;
+}
+
+static gboolean
+gum_swift_api_resolver_ensure_demangler (GumSwiftApiResolver * self)
+{
+  GumModule * swift_core, * allocator;
+
+  if (self->swift_demangle != NULL)
+    return TRUE;
+
+  swift_core = gum_process_find_module_by_name (GUM_SWIFT_CORE_MODULE);
+  if (swift_core == NULL)
+    return FALSE;
+
+#if defined (HAVE_WINDOWS)
+  allocator = gum_process_find_module_by_name ("ucrtbase.dll");
+#elif defined (HAVE_DARWIN)
+  allocator = gum_process_find_module_by_name (
+      "/usr/lib/system/libsystem_malloc.dylib");
+#else
+  allocator = g_object_ref (gum_process_get_libc_module ());
+#endif
+  self->libc_free = GUM_POINTER_TO_FUNCPTR (GumLibcFreeFunc,
+      gum_module_find_export_by_name (allocator, "free"));
+  g_object_unref (allocator);
+
+  self->swift_demangle = GUM_POINTER_TO_FUNCPTR (GumSwiftDemangle,
+      gum_module_find_export_by_name (swift_core, "swift_demangle"));
+
+  g_object_unref (swift_core);
+
+  return self->swift_demangle != NULL;
+}
+
+static gchar *
+gum_swift_api_resolver_demangle (GumSwiftApiResolver * self,
+                                 const gchar * name)
+{
+  gchar * raw, * result;
+
+  raw = self->swift_demangle (name, strlen (name), NULL, NULL, 0);
+  if (raw == NULL)
+    return NULL;
+
+  result = g_strdup (raw);
+  self->libc_free (raw);
+
+  return result;
+}
+
 static void
 gum_function_metadata_free (GumFunctionMetadata * function)
 {
@@ -1036,7 +1624,8 @@ gum_function_metadata_free (GumFunctionMetadata * function)
 }
 
 static void
-gum_class_parse (GumClass * klass,
+gum_class_parse (GumSwiftApiResolver * resolver,
+                 GumClass * klass,
                  const GumClassDescriptor * cd)
 {
   const GumTypeContextDescriptor * type;
@@ -1047,7 +1636,7 @@ gum_class_parse (GumClass * klass,
 
   type = &cd->type_context;
 
-  klass->name = gum_compute_context_descriptor_name (&type->context);
+  klass->name = gum_compute_context_descriptor_name (resolver, &type->context);
 
   trailer = cd + 1;
 
@@ -1113,7 +1702,8 @@ gum_resolve_method_implementation (const GumRelativeDirectPtr * impl,
 }
 
 static gchar *
-gum_compute_context_descriptor_name (const GumContextDescriptor * cd)
+gum_compute_context_descriptor_name (GumSwiftApiResolver * resolver,
+                                     const GumContextDescriptor * cd)
 {
   GString * name;
   const GumContextDescriptor * cur;
@@ -1148,14 +1738,14 @@ gum_compute_context_descriptor_name (const GumContextDescriptor * cd)
         part = g_string_sized_new (64);
         g_string_append (part, "(extension in ");
 
-        parent = gum_compute_context_descriptor_name (
+        parent = gum_compute_context_descriptor_name (resolver,
             gum_resolve_relative_indirectable_ptr (&cur->parent));
         g_string_append (part, parent);
         g_free (parent);
 
         g_string_append (part, "):");
 
-        gum_append_demangled_context_name (part,
+        gum_append_demangled_context_name (resolver, part,
             gum_resolve_relative_direct_ptr (&e->extended_context));
 
         if (name->len != 0)
@@ -1171,6 +1761,14 @@ gum_compute_context_descriptor_name (const GumContextDescriptor * cd)
       }
       case GUM_CONTEXT_DESCRIPTOR_ANONYMOUS:
         break;
+      case GUM_CONTEXT_DESCRIPTOR_PROTOCOL:
+      {
+        const GumProtocolDescriptor * p = (const GumProtocolDescriptor *) cur;
+        if (name->len != 0)
+          g_string_prepend_c (name, '.');
+        g_string_prepend (name, gum_resolve_relative_direct_ptr (&p->name));
+        break;
+      }
       default:
         if (kind >= GUM_CONTEXT_DESCRIPTOR_TYPE_FIRST &&
             kind <= GUM_CONTEXT_DESCRIPTOR_TYPE_LAST)
@@ -1191,7 +1789,8 @@ gum_compute_context_descriptor_name (const GumContextDescriptor * cd)
 }
 
 static void
-gum_append_demangled_context_name (GString * result,
+gum_append_demangled_context_name (GumSwiftApiResolver * resolver,
+                                   GString * result,
                                    const gchar * mangled_name)
 {
   switch (mangled_name[0])
@@ -1203,7 +1802,7 @@ gum_append_demangled_context_name (GString * result,
 
       cd = gum_resolve_relative_direct_ptr (
           (const GumRelativeDirectPtr *) (mangled_name + 1));
-      name = gum_compute_context_descriptor_name (cd);
+      name = gum_compute_context_descriptor_name (resolver, cd);
       g_string_append (result, name);
       g_free (name);
 
@@ -1216,7 +1815,7 @@ gum_append_demangled_context_name (GString * result,
 
       cd = gum_resolve_relative_indirect_ptr (
           (const GumRelativeIndirectPtr *) (mangled_name + 1));
-      name = gum_compute_context_descriptor_name (cd);
+      name = gum_compute_context_descriptor_name (resolver, cd);
       g_string_append (result, name);
       g_free (name);
 
@@ -1231,7 +1830,7 @@ gum_append_demangled_context_name (GString * result,
       g_string_append (buf, "$s");
       g_string_append (buf, mangled_name);
 
-      name = gum_demangle (buf->str);
+      name = gum_swift_api_resolver_demangle (resolver, buf->str);
       if (name != NULL)
       {
         g_string_append (result, name);
@@ -1386,43 +1985,16 @@ gum_resolve_relative_indirectable_ptr (const GumRelativeIndirectablePtr * delta)
   return gum_strip_code_pointer ((gpointer) *target);
 }
 
-static gboolean
-gum_ensure_demangler (void)
+static gconstpointer
+gum_resolve_protocol_record (const GumRelativeIndirectablePtr * record)
 {
-  GumModule * swift_core, * libsystem_malloc;
+  GumRelativeIndirectablePtr val = *record & ~GUM_PROTOCOL_RECORD_RESERVED_BIT;
+  gconstpointer * target;
 
-  if (gum_demangle_impl != NULL)
-    return TRUE;
+  if ((val & 1) == 0)
+    return (const guint8 *) record + val;
 
-  swift_core = gum_process_find_module_by_name ("libswiftCore.dylib");
-  if (swift_core == NULL)
-    return FALSE;
+  target = (gconstpointer *) ((const guint8 *) record + (val & ~1));
 
-  libsystem_malloc = gum_process_find_module_by_name (
-      "/usr/lib/system/libsystem_malloc.dylib");
-  gum_libc_free = GUM_POINTER_TO_FUNCPTR (GumLibcFreeFunc,
-      gum_module_find_export_by_name (libsystem_malloc, "free"));
-  g_object_unref (libsystem_malloc);
-
-  gum_demangle_impl = GUM_POINTER_TO_FUNCPTR (GumSwiftDemangle,
-      gum_module_find_export_by_name (swift_core, "swift_demangle"));
-
-  g_object_unref (swift_core);
-
-  return gum_demangle_impl != NULL;
-}
-
-static gchar *
-gum_demangle (const gchar * name)
-{
-  gchar * raw, * result;
-
-  raw = gum_demangle_impl (name, strlen (name), NULL, NULL, 0);
-  if (raw == NULL)
-    return NULL;
-
-  result = g_strdup (raw);
-  gum_libc_free (raw);
-
-  return result;
+  return gum_strip_code_pointer ((gpointer) *target);
 }

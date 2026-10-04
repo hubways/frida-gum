@@ -304,6 +304,8 @@ TESTLIST_BEGIN (script)
     TESTENTRY (utf8_string_can_be_written)
     TESTENTRY (utf16_string_can_be_read)
     TESTENTRY (utf16_string_can_be_written)
+    TESTENTRY (memory_can_be_read_at_offset)
+    TESTENTRY (memory_can_be_written_at_offset)
 #ifdef HAVE_WINDOWS
     TESTENTRY (ansi_string_can_be_read_in_code_page_936)
     TESTENTRY (ansi_string_can_be_read_in_code_page_1252)
@@ -977,6 +979,7 @@ TESTCASE (instruction_can_be_parsed)
       "cw.putInstruction(0x8b230841);" /* add x1, x2, w3, uxtb #2 */
       "cw.putInstruction(0x4ee28420);" /* add.2d v0, v1, v2 */
       "cw.putInstruction(0x9eae00e5);" /* fmov.d x5, v7[1] */
+      "cw.putInstruction(0x4e012c08);" /* smov x8, v0.b[0] */
       "cw.flush();"
 
       "const ldr = Instruction.parse(code);"
@@ -1026,6 +1029,13 @@ TESTCASE (instruction_can_be_parsed)
       "send(fmov.mnemonic);"
       "operands = fmov.operands;"
       "send(typeof operands[0].vectorIndex);"
+      "send(operands[1].vectorIndex);"
+
+      "const smov = Instruction.parse(fmov.next);"
+      "send(smov.mnemonic);"
+      "operands = smov.operands;"
+      "send(typeof operands[0].vas);"
+      "send(operands[1].vas);"
       "send(operands[1].vectorIndex);");
 
   EXPECT_SEND_MESSAGE_WITH ("\"ldr\"");
@@ -1062,6 +1072,11 @@ TESTCASE (instruction_can_be_parsed)
   EXPECT_SEND_MESSAGE_WITH ("\"fmov\"");
   EXPECT_SEND_MESSAGE_WITH ("\"undefined\"");
   EXPECT_SEND_MESSAGE_WITH ("1");
+
+  EXPECT_SEND_MESSAGE_WITH ("\"smov\"");
+  EXPECT_SEND_MESSAGE_WITH ("\"undefined\"");
+  EXPECT_SEND_MESSAGE_WITH ("\"1b\"");
+  EXPECT_SEND_MESSAGE_WITH ("0");
 #else
   g_print ("<skipping, missing code for current architecture> ");
 #endif
@@ -3416,6 +3431,55 @@ TESTCASE (utf16_string_can_be_written)
   g_assert_cmphex (str[5], ==, '\0');
 
   g_free (str);
+}
+
+TESTCASE (memory_can_be_read_at_offset)
+{
+  struct
+  {
+    guint16 kind;
+    guint16 count;
+    guint32 id;
+    gchar name[4];
+  } record = { 1, 2, 120123, "abc" };
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "const record = " GUM_PTR_CONST ";"
+      "send(record.readU16(2));"
+      "send(record.readU32(4));"
+      "send(record.readUtf8String(-1, 8));"
+      "send('badger', record.readByteArray(2, 8));"
+      "send('snake', record.readVolatile(2, 9));",
+      &record);
+  EXPECT_SEND_MESSAGE_WITH ("2");
+  EXPECT_SEND_MESSAGE_WITH ("120123");
+  EXPECT_SEND_MESSAGE_WITH ("\"abc\"");
+  EXPECT_SEND_MESSAGE_WITH_PAYLOAD_AND_DATA ("\"badger\"", "61 62");
+  EXPECT_SEND_MESSAGE_WITH_PAYLOAD_AND_DATA ("\"snake\"", "62 63");
+}
+
+TESTCASE (memory_can_be_written_at_offset)
+{
+  struct
+  {
+    guint16 kind;
+    guint16 count;
+    guint32 id;
+    gchar name[4];
+  } record = { 0, };
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "const record = " GUM_PTR_CONST ";"
+      "record"
+      "    .writeU16(2, 2)"
+      "    .writeU32(120123, 4)"
+      "    .writeUtf8String('abc', 8)"
+      "    .writeVolatile([0x64], 10);",
+      &record);
+  g_assert_cmpuint (record.kind, ==, 0);
+  g_assert_cmpuint (record.count, ==, 2);
+  g_assert_cmpuint (record.id, ==, 120123);
+  g_assert_cmpstr (record.name, ==, "abd");
 }
 
 #ifdef HAVE_WINDOWS

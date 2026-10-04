@@ -4,6 +4,7 @@
  * Copyright (C) 2015 Asger Hautop Drewsen <asgerdrewsen@gmail.com>
  * Copyright (C) 2023 Grant Douglas <me@hexplo.it>
  * Copyright (C) 2025 William Tan <1284324+Ninja3047@users.noreply.github.com>
+ * Copyright (C) 2026 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -43,10 +44,14 @@ TESTLIST_BEGIN (process)
   TESTENTRY (process_ranges)
   TESTENTRY (process_ranges_exclude_cloaked)
   TESTENTRY (thread_ranges_can_be_enumerated)
+#ifdef HAVE_FRIDA_GLIB
+  TESTENTRY (internal_thread_leaves_no_stack_contents_behind)
+#endif
   TESTENTRY (module_can_be_loaded)
   TESTENTRY (module_imports)
   TESTENTRY (module_import_slot_should_contain_correct_value)
   TESTENTRY (module_exports)
+  TESTENTRY (module_exports_with_prefix)
   TESTENTRY (module_symbols)
   TESTENTRY (module_ranges_can_be_enumerated)
   TESTENTRY (module_sections_can_be_enumerated)
@@ -87,6 +92,7 @@ typedef struct _TestForEachContext TestForEachContext;
 typedef struct _TestThreadContext TestThreadContext;
 typedef struct _TestRangeContext TestRangeContext;
 typedef struct _TestThreadSyncData TestThreadSyncData;
+typedef struct _TestStackLeakProbe TestStackLeakProbe;
 
 struct _TestForEachContext
 {
@@ -117,6 +123,13 @@ struct _TestThreadSyncData
   volatile gboolean * volatile done;
 };
 
+struct _TestStackLeakProbe
+{
+  guint8 marker[64];
+  guint8 * marker_address;
+  gboolean thread_was_cloaked;
+};
+
 #ifdef HAVE_DARWIN
 
 typedef struct _ExportSearch ExportSearch;
@@ -134,6 +147,7 @@ static gboolean check_thread_enumeration_testable (void);
 
 static gpointer probe_thread (gpointer data);
 static void inspect_thread_ranges (void);
+static gpointer leave_marker_on_stack (gpointer data);
 
 static gboolean store_import_slot_of_malloc_if_available (
     const GumImportDetails * details, gpointer user_data);
@@ -161,6 +175,8 @@ G_GNUC_UNUSED static gboolean thread_collect_if_matching_id (
     const GumThreadDetails * details, gpointer user_data);
 static gboolean module_found_cb (GumModule * module, gpointer user_data);
 static gboolean import_found_cb (const GumImportDetails * details,
+    gpointer user_data);
+static gboolean collect_export (const GumExportDetails * details,
     gpointer user_data);
 static gboolean export_found_cb (const GumExportDetails * details,
     gpointer user_data);
@@ -681,6 +697,58 @@ inspect_thread_ranges (void)
   }
 }
 
+#ifdef HAVE_FRIDA_GLIB
+
+TESTCASE (internal_thread_leaves_no_stack_contents_behind)
+{
+  TestStackLeakProbe probe;
+  guint i;
+  guint8 * contents;
+  gsize n_bytes_read;
+
+  for (i = 0; i != sizeof (probe.marker); i++)
+    probe.marker[i] = 0xa5 ^ i;
+  probe.marker_address = NULL;
+
+  g_thread_join (g_thread_new ("leaky-thread", leave_marker_on_stack, &probe));
+
+  if (!probe.thread_was_cloaked)
+  {
+    g_print ("<skipping, thread callbacks not installed> ");
+    return;
+  }
+
+  contents = gum_memory_read (probe.marker_address, sizeof (probe.marker),
+      &n_bytes_read);
+  if (contents == NULL)
+  {
+    g_print ("<skipping, stack unmapped on exit> ");
+    return;
+  }
+
+  g_assert_cmpint (memcmp (contents, probe.marker, sizeof (probe.marker)),
+      !=, 0);
+
+  g_free (contents);
+}
+
+#endif
+
+static gpointer
+leave_marker_on_stack (gpointer data)
+{
+  TestStackLeakProbe * probe = data;
+  guint8 scratch[64 * 1024];
+
+  probe->thread_was_cloaked =
+      gum_cloak_has_thread (gum_process_get_current_thread_id ());
+
+  memcpy (scratch, probe->marker, sizeof (probe->marker));
+  g_atomic_pointer_set (&probe->marker_address, scratch);
+
+  return NULL;
+}
+
 #if defined (HAVE_WINDOWS) || defined (HAVE_DARWIN)
 
 #define TEST_STACK_BUFFER_SIZE 50
@@ -846,6 +914,53 @@ TESTCASE (module_exports)
   gum_module_enumerate_exports (module, export_found_cb, &ctx);
   g_assert_cmpuint (ctx.number_of_calls, ==, 1);
 
+  g_object_unref (module);
+}
+
+TESTCASE (module_exports_with_prefix)
+{
+  GumModule * module;
+  GHashTable * all, * with_prefix;
+  GHashTableIter iter;
+  const gchar * name;
+  GumAddress * address;
+  gchar * prefix;
+  guint expected = 0;
+
+  module = gum_process_find_module_by_name (SYSTEM_MODULE_NAME);
+  g_assert_nonnull (module);
+
+  all = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+  gum_module_enumerate_exports (module, collect_export, all);
+  g_assert_cmpuint (g_hash_table_size (all), >, 1);
+
+  g_hash_table_iter_init (&iter, all);
+  g_hash_table_iter_next (&iter, (gpointer *) &name, NULL);
+  prefix = g_strndup (name, 2);
+
+  with_prefix = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+  gum_module_enumerate_exports_with_prefix (module, prefix, collect_export,
+      with_prefix);
+
+  g_hash_table_iter_init (&iter, all);
+  while (g_hash_table_iter_next (&iter, (gpointer *) &name,
+      (gpointer *) &address))
+  {
+    GumAddress * found;
+
+    if (!g_str_has_prefix (name, prefix))
+      continue;
+    expected++;
+
+    found = g_hash_table_lookup (with_prefix, name);
+    g_assert_nonnull (found);
+    g_assert_cmphex (*found, ==, *address);
+  }
+  g_assert_cmpuint (g_hash_table_size (with_prefix), ==, expected);
+
+  g_hash_table_unref (with_prefix);
+  g_free (prefix);
+  g_hash_table_unref (all);
   g_object_unref (module);
 }
 
@@ -1359,6 +1474,18 @@ import_found_cb (const GumImportDetails * details,
     g_assert_cmpint (details->type, ==, GUM_IMPORT_FUNCTION);
 
   return ctx->value_to_return;
+}
+
+static gboolean
+collect_export (const GumExportDetails * details,
+                gpointer user_data)
+{
+  GHashTable * exports = user_data;
+
+  g_hash_table_insert (exports, g_strdup (details->name),
+      g_memdup2 (&details->address, sizeof (GumAddress)));
+
+  return TRUE;
 }
 
 static gboolean

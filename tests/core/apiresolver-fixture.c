@@ -16,8 +16,13 @@
 #endif
 
 #include <string.h>
-#ifdef HAVE_DARWIN
+#ifdef HAVE_WINDOWS
+# include <windows.h>
+#else
 # include <dlfcn.h>
+#endif
+#ifdef HAVE_ELF
+# include <stdlib.h>
 #endif
 
 #define TESTCASE(NAME) \
@@ -59,4 +64,9 @@ static gboolean check_module_import (const GumApiDetails * details,
 static gboolean check_section (const GumApiDetails * details,
     gpointer user_data);
 static gboolean match_found_cb (const GumApiDetails * details,
+    gpointer user_data);
+static GHashTable * make_match_table (void);
+static gboolean collect_match (const GumApiDetails * details,
+    gpointer user_data);
+static gboolean resolve_method_impl (const GumApiDetails * details,
     gpointer user_data);
