@@ -5,6 +5,7 @@
  * Copyright (C) 2023 Grant Douglas <me@hexplo.it>
  * Copyright (C) 2025 William Tan <1284324+Ninja3047@users.noreply.github.com>
  * Copyright (C) 2026 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2026 T Shivanesh Kumar <tshivaneshk@users.noreply.github.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -15,6 +16,7 @@
 
 #ifndef HAVE_WINDOWS
 #include <dlfcn.h>
+#include <pthread.h>
 #else
 #include <windows.h>
 #endif
@@ -27,6 +29,12 @@
 
 #if defined (HAVE_LINUX)
 # include "gum/gumlinux.h"
+#endif
+
+#ifdef HAVE_WINDOWS
+# define IMPORT_SLOT_TEST_SYMBOL "VirtualAlloc"
+#else
+# define IMPORT_SLOT_TEST_SYMBOL "malloc"
 #endif
 
 #define TESTCASE(NAME) \
@@ -46,6 +54,9 @@ TESTLIST_BEGIN (process)
   TESTENTRY (thread_ranges_can_be_enumerated)
 #ifdef HAVE_FRIDA_GLIB
   TESTENTRY (internal_thread_leaves_no_stack_contents_behind)
+#ifndef HAVE_WINDOWS
+  TESTENTRY (adopted_thread_can_be_finalized)
+#endif
 #endif
   TESTENTRY (module_can_be_loaded)
   TESTENTRY (module_imports)
@@ -148,8 +159,12 @@ static gboolean check_thread_enumeration_testable (void);
 static gpointer probe_thread (gpointer data);
 static void inspect_thread_ranges (void);
 static gpointer leave_marker_on_stack (gpointer data);
+#ifndef HAVE_WINDOWS
+static gpointer check_thread_is_cloaked (gpointer data);
+static void * adopt_into_glib (void * data);
+#endif
 
-static gboolean store_import_slot_of_malloc_if_available (
+static gboolean store_import_details_if_test_symbol (
     const GumImportDetails * details, gpointer user_data);
 
 #ifndef HAVE_WINDOWS
@@ -749,6 +764,51 @@ leave_marker_on_stack (gpointer data)
   return NULL;
 }
 
+#if defined (HAVE_FRIDA_GLIB) && !defined (HAVE_WINDOWS)
+
+TESTCASE (adopted_thread_can_be_finalized)
+{
+  gboolean callbacks_installed = FALSE;
+  pthread_t thread;
+  gboolean adopted = FALSE;
+
+  g_thread_join (g_thread_new ("probe", check_thread_is_cloaked,
+      &callbacks_installed));
+  if (!callbacks_installed)
+  {
+    g_print ("<skipping, thread callbacks not installed> ");
+    return;
+  }
+
+  g_assert_cmpint (pthread_create (&thread, NULL, adopt_into_glib, &adopted),
+      ==, 0);
+  g_assert_cmpint (pthread_join (thread, NULL), ==, 0);
+
+  g_assert_true (adopted);
+}
+
+static gpointer
+check_thread_is_cloaked (gpointer data)
+{
+  gboolean * cloaked = data;
+
+  *cloaked = gum_cloak_has_thread (gum_process_get_current_thread_id ());
+
+  return NULL;
+}
+
+static void *
+adopt_into_glib (void * data)
+{
+  gboolean * adopted = data;
+
+  *adopted = g_thread_self () != NULL;
+
+  return NULL;
+}
+
+#endif
+
 #if defined (HAVE_WINDOWS) || defined (HAVE_DARWIN)
 
 #define TEST_STACK_BUFFER_SIZE 50
@@ -856,43 +916,57 @@ TESTCASE (module_imports)
 TESTCASE (module_import_slot_should_contain_correct_value)
 {
   GumModule * module;
+  GumImportDetails import;
+  gboolean unsupported_on_this_os;
   gpointer * slot;
   gsize actual_value, expected_value;
-  gboolean unsupported_on_this_os;
+  GumModule * provider;
 
   module = gum_process_find_module_by_name (GUM_TESTS_MODULE_NAME);
   g_assert_nonnull (module);
 
-  slot = NULL;
-  gum_module_enumerate_imports (module,
-      store_import_slot_of_malloc_if_available, &slot);
+  import.slot = 0;
+  gum_module_enumerate_imports (module, store_import_details_if_test_symbol,
+      &import);
 
   g_clear_object (&module);
 
-  unsupported_on_this_os = slot == NULL;
+  unsupported_on_this_os = import.slot == 0;
   if (unsupported_on_this_os)
   {
     g_print ("<skipping, not yet supported on this OS> ");
     return;
   }
 
+  slot = GSIZE_TO_POINTER (import.slot);
   actual_value = gum_strip_code_address (GPOINTER_TO_SIZE (*slot));
+
+#ifdef HAVE_WINDOWS
+  provider = gum_process_find_module_by_name ("kernel32.dll");
+#else
+  provider = g_object_ref (gum_process_get_libc_module ());
+#endif
   expected_value = gum_strip_code_address (gum_module_find_export_by_name (
-        gum_process_get_libc_module (), "malloc"));
+        provider, IMPORT_SLOT_TEST_SYMBOL));
+  g_object_unref (provider);
 
   g_assert_cmphex (actual_value, ==, expected_value);
+#if defined (HAVE_WINDOWS) || defined (HAVE_DARWIN)
+  g_assert_cmphex (gum_strip_code_address (import.address), ==,
+      expected_value);
+#endif
 }
 
 static gboolean
-store_import_slot_of_malloc_if_available (const GumImportDetails * details,
-                                          gpointer user_data)
+store_import_details_if_test_symbol (const GumImportDetails * details,
+                                     gpointer user_data)
 {
-  gpointer ** result = user_data;
+  GumImportDetails * import = user_data;
 
-  if (strcmp (details->name, "malloc") != 0)
+  if (strcmp (details->name, IMPORT_SLOT_TEST_SYMBOL) != 0)
     return TRUE;
 
-  *result = GSIZE_TO_POINTER (details->slot);
+  *import = *details;
   return FALSE;
 }
 
