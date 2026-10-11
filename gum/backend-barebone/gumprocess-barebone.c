@@ -156,13 +156,13 @@ gum_thread_try_get_ranges (GumMemoryRange * ranges,
   return 0;
 }
 
-gint
+G_GNUC_WEAK gint
 gum_thread_get_system_error (void)
 {
   return 0;
 }
 
-void
+G_GNUC_WEAK void
 gum_thread_set_system_error (gint value)
 {
 }
@@ -242,4 +242,17 @@ gum_throw_not_supported (GError ** error)
 {
   g_set_error (error, GUM_ERROR, GUM_ERROR_NOT_SUPPORTED,
       "Not supported by the Barebone backend");
+}
+
+G_GNUC_WEAK gchar *
+gum_barebone_ansi_string_to_utf8 (const gchar * str_ansi,
+                                  gint length)
+{
+  return NULL;
+}
+
+G_GNUC_WEAK gchar *
+gum_barebone_ansi_string_from_utf8 (const gchar * str_utf8)
+{
+  return NULL;
 }

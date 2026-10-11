@@ -508,8 +508,9 @@ GUMJS_DEFINE_CLASS_GETTER (gumjs_statement_get_params_count, GumStatement)
 
 GUMJS_DEFINE_CLASS_METHOD (gumjs_statement_bind_integer, GumStatement)
 {
-  gint index, value;
-  if (!_gum_v8_args_parse (args, "ii", &index, &value))
+  gint index;
+  gint64 value;
+  if (!_gum_v8_args_parse (args, "iq", &index, &value))
     return;
 
   GumV8InterceptorIgnoreScope interceptor_ignore_scope;
@@ -679,7 +680,7 @@ gum_parse_column (Isolate * isolate,
     case SQLITE_INTEGER:
       return Number::New (isolate, sqlite3_column_int64 (statement, index));
     case SQLITE_FLOAT:
-      return Number::New (isolate, sqlite3_column_int64 (statement, index));
+      return Number::New (isolate, sqlite3_column_double (statement, index));
     case SQLITE_TEXT:
       return String::NewFromUtf8 (isolate,
           (const char *) sqlite3_column_text (statement, index),
