@@ -16,11 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if G_BYTE_ORDER == G_BIG_ENDIAN
-# define GUM_QUICKJS_BYTECODE_MAGIC 0x42
-#else
-# define GUM_QUICKJS_BYTECODE_MAGIC 0x02
-#endif
+#define GUM_QUICKJS_BYTECODE_MAGIC 0x05
 
 typedef struct _GumCompileProgramOperation GumCompileProgramOperation;
 typedef struct _GumCreateScriptData GumCreateScriptData;
@@ -1033,20 +1029,13 @@ gum_compile_script_task_run (GumScriptTask * task,
     uint8_t * code;
     size_t size;
     GBytes * bytes;
-    GDestroyNotify free_impl;
 
     /* TODO: Add support for compiling ESM-flavored scripts to bytecode. */
     val = g_array_index (program->entrypoints, JSValue, 0);
 
-#ifndef HAVE_ASAN
-    free_impl = gum_free;
-#else
-    free_impl = free;
-#endif
-
     code = JS_WriteObject (ctx, &size, val, JS_WRITE_OBJ_BYTECODE);
-
-    bytes = g_bytes_new_with_free_func (code, size, free_impl, code);
+    bytes = g_bytes_new (code, size);
+    js_free (ctx, code);
 
     gum_script_task_return_pointer (task, bytes,
         (GDestroyNotify) g_bytes_unref);

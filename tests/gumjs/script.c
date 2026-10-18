@@ -367,6 +367,7 @@ TESTLIST_BEGIN (script)
     TESTENTRY (native_callback_should_be_kept_alive_during_calls)
     TESTENTRY (native_callback_can_return_struct)
     TESTENTRY (native_callback_can_return_large_nested_struct)
+    TESTENTRY (native_callback_can_receive_struct)
     TESTENTRY (native_callback_should_zero_retval_on_mismatching_return_value)
 #ifdef HAVE_WINDOWS
 # if GLIB_SIZEOF_VOID_P == 4
@@ -573,6 +574,7 @@ typedef struct _GumRecoverExceptorContext GumRecoverExceptorContext;
 typedef struct _TestTrigger TestTrigger;
 typedef struct _TestNativeReturnStruct TestNativeReturnStruct;
 typedef struct _TestNativeReturnNestedStruct TestNativeReturnNestedStruct;
+typedef struct _TestNativeSmallStruct TestNativeSmallStruct;
 typedef struct _GumHotNamedSleeperContext GumHotNamedSleeperContext;
 
 struct _GumInvokeTargetContext
@@ -640,6 +642,13 @@ struct _TestNativeReturnNestedStruct
     } e;
   } a;
   int64_t b;
+};
+
+struct _TestNativeSmallStruct
+{
+  uint8_t a;
+  uint16_t b;
+  uint32_t c;
 };
 
 struct _GumHotNamedSleeperContext
@@ -2466,6 +2475,22 @@ TESTCASE (native_callback_can_return_large_nested_struct)
   g_assert_cmpint (retval.a.e.b, ==, 6);
   g_assert_cmpint (retval.a.e.c, ==, 7);
   g_assert_cmpint (retval.b, ==, 8);
+}
+
+TESTCASE (native_callback_can_receive_struct)
+{
+  void (* cb) (uint8_t a, TestNativeSmallStruct s);
+  TestNativeSmallStruct s = { 2, 3, 4 };
+
+  COMPILE_AND_LOAD_SCRIPT (
+      "let cb = new NativeCallback((a, s) => {"
+        "send([a, s]);"
+      "}, 'void', ['uint8', ['uint8', 'uint16', 'uint32']]);"
+      GUM_PTR_CONST ".writePointer(cb);",
+      &cb);
+
+  cb (1, s);
+  EXPECT_SEND_MESSAGE_WITH ("[1,[2,3,4]]");
 }
 
 TESTCASE (native_callback_should_zero_retval_on_mismatching_return_value)
@@ -10037,7 +10062,8 @@ TESTCASE (cmodule_should_report_parsing_errors)
 TESTCASE (cmodule_should_report_linking_errors)
 {
   const gchar * expected_message =
-      "(Error: linking failed: tcc: error: undefined symbol '"
+      "(Error: linking failed: tcc: error: "
+      "(undefined symbol|unresolved reference to) '_?"
 #ifdef HAVE_DARWIN
       "_"
 #endif
@@ -11569,12 +11595,12 @@ TESTCASE (dynamic_script_evaluated_should_support_inline_source_map)
   {
     g_assert_nonnull (strstr (item->message,
         "\"payload\":\"Error: not yet implemented\\n"
-        "    at add (agent/math.ts:2)\\n"
-        "    at <anonymous> (agent/index.ts:4)\\n"
+        "    at add (agent/math.ts:2:20)\\n"
+        "    at <anonymous> (agent/index.ts:4:13)\\n"
         "    at call (native)\\n"
-        "    at o (node_modules/browser-pack/_prelude.js:1)\\n"
-        "    at r (node_modules/browser-pack/_prelude.js:1)\\n"
-        "    at <eval> (/user.js:21)"));
+        "    at o (node_modules/browser-pack/_prelude.js:1:1)\\n"
+        "    at r (node_modules/browser-pack/_prelude.js:1:1)\\n"
+        "    at <eval> (node_modules/browser-pack/_prelude.js:1:1)"));
   }
   else
   {
@@ -11648,8 +11674,8 @@ TESTCASE (dynamic_script_loaded_should_support_inline_source_map)
   {
     g_assert_nonnull (strstr (item->message,
         "\"payload\":\"Error: not yet implemented\\n"
-        "    at add (agent/math.ts:2)\\n"
-        "    at <anonymous> (agent/index.ts:4)"));
+        "    at add (agent/math.ts:2:20)\\n"
+        "    at <anonymous> (agent/index.ts:4:13)"));
   }
   else
   {
@@ -11716,8 +11742,8 @@ TESTCASE (dynamic_script_loaded_should_support_separate_source_map)
   {
     g_assert_nonnull (strstr (item->message,
         "\"payload\":\"Error: not yet implemented\\n"
-        "    at add (agent/math.ts:2)\\n"
-        "    at <anonymous> (agent/index.ts:4)"));
+        "    at add (agent/math.ts:2:20)\\n"
+        "    at <anonymous> (agent/index.ts:4:13)"));
   }
   else
   {
@@ -11939,14 +11965,15 @@ TESTCASE (source_maps_should_be_supported_for_user_scripts)
   {
     g_assert_nonnull (strstr (item->message,
         "\"payload\":\"Error: not yet implemented\\n"
-        "    at add (math.js:5)\\n"
-        "    at <anonymous> (index.js:6)\\n"
+        "    at add (math.js:5:1)\\n"
+        "    at <anonymous> (index.js:6:1)\\n"
         "    at call (native)\\n"
         "    at s (node_modules/frida/node_modules/browserify/node_modules/"
-            "browser-pack/_prelude.js:1)\\n"
+            "browser-pack/_prelude.js:1:1)\\n"
         "    at e (node_modules/frida/node_modules/browserify/node_modules/"
-            "browser-pack/_prelude.js:1)\\n"
-        "    at <eval> (/testcase.js:25)"));
+            "browser-pack/_prelude.js:1:1)\\n"
+        "    at <eval> (node_modules/frida/node_modules/browserify/"
+            "node_modules/browser-pack/_prelude.js:1:1)"));
   }
   else
   {
@@ -11970,7 +11997,7 @@ TESTCASE (source_maps_should_be_supported_for_user_scripts)
   if (GUM_QUICK_IS_SCRIPT_BACKEND (fixture->backend))
   {
     g_assert_nonnull (strstr (item->message, "\"stack\":\"Error: Oops!\\n"
-        "    at <anonymous> (index.js:12)\\n"));
+        "    at <anonymous> (index.js:12:1)\\n"));
   }
   else
   {

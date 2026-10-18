@@ -1,6 +1,7 @@
 /*
  * Copyright (C) 2015-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2023-2024 Francesco Tamagni <mrmacete@protonmail.ch>
+ * Copyright (C) 2026 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -51,6 +52,8 @@
 #endif
 
 #ifdef GUM_FUNCTION_RANGE_USES_EXIDX
+# define GUM_EXIDX_CANTUNWIND 1
+
 typedef gsize _Unwind_Ptr;
 #endif
 
@@ -500,6 +503,11 @@ gboolean
 gum_process_find_function_range (gconstpointer address,
                                  GumMemoryRange * range)
 {
+#ifdef HAVE_DARWIN
+  if (_gum_darwin_find_function_range_from_function_starts (address, range))
+    return TRUE;
+#endif
+
   if (gum_find_function_range_from_unwind_info (address, range))
     return TRUE;
 
@@ -681,6 +689,9 @@ gum_find_function_range_from_unwind_info (gconstpointer address,
       break;
   }
   if (match == -1 || match == count - 1)
+    return FALSE;
+
+  if (entries[2 * match + 1] == GUM_EXIDX_CANTUNWIND)
     return FALSE;
 
   range->base_address = gum_decode_prel31 (&entries[2 * match]);

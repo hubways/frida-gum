@@ -552,10 +552,11 @@ endif
 if host_os_family in ['linux', 'freebsd', 'qnx']
   libunwind_dep = dependency('libunwind', default_options: [
     'default_library=static',
-    'generic_library=disabled',
-    'coredump_library=disabled',
-    'ptrace_library=disabled',
-    'setjmp_library=disabled',
+    'coredump=disabled',
+    'ptrace=disabled',
+    'nto=disabled',
+    'setjmp=disabled',
+    'documentation=disabled',
     'msabi_support=false',
     'minidebuginfo=enabled',
     'zlibdebuginfo=enabled',
@@ -643,6 +644,7 @@ if have_inspector
       'gssapi=disabled',
       'ntlm=disabled',
       'brotli=disabled',
+      'zstd=disabled',
       'tls_check=false',
       'introspection=disabled',
       'vapi=disabled',
@@ -660,7 +662,6 @@ if have_gumjs
   quickjs_options = [
     'default_library=static',
     'libc=false',
-    'bignum=true',
     'atomics=disabled',
     'stack_check=' + ((host_os_family == 'none') ? 'enabled' : 'disabled'),
     'stack_mode=' + ((host_os_family == 'none') ? 'optimize' : 'default'),
@@ -681,8 +682,8 @@ if have_gumjs
     quickjs_dep_native = dependency('quickjs', native: true, default_options: quickjs_options)
   endif
 
-  v8_dep = dependency('v8-10.0',
-    version: '>=10.6.122',
+  v8_dep = dependency('v8-15.7',
+    version: '>=15.7.0',
     required: get_option('v8'),
     default_options: [
       'default_library=static',
@@ -690,13 +691,12 @@ if have_gumjs
       'embedder_string=-frida',
       'snapshot_compression=disabled',
       'pointer_compression=disabled',
-      'shared_ro_heap=disabled',
       'cppgc_caged_heap=disabled',
     ],
   )
   cdata.set('HAVE_V8', v8_dep.found())
   if v8_dep.found()
-    gumjs_extra_requires += 'v8-10.0'
+    gumjs_extra_requires += 'v8-15.7'
   endif
 
   if not (quickjs_dep.found() or v8_dep.found())

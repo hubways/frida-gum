@@ -1,6 +1,6 @@
 [wrap-git]
 url = https://github.com/frida/json-glib.git
-revision = 1a39cbe151b02c4192987c8fcc98997a59db2154
+revision = 0242c39f1f60f844c9df41e83434251b06609e82
 depth = 1
 
 [provide]

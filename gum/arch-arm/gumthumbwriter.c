@@ -76,6 +76,8 @@ static gboolean gum_thumb_writer_try_commit_label_refs (GumThumbWriter * self);
 static gboolean gum_thumb_writer_do_commit_label (GumThumbLabelRef * r,
     const guint16 * target_insn);
 static void gum_thumb_writer_maybe_commit_literals (GumThumbWriter * self);
+static gboolean gum_thumb_writer_has_unresolved_short_branches (
+    GumThumbWriter * self);
 static void gum_thumb_writer_commit_literals (GumThumbWriter * self);
 
 static gboolean gum_instruction_is_t1_load (guint16 instruction);
@@ -764,8 +766,6 @@ gum_thumb_writer_put_push_or_pop_regs (GumThumbWriter * self,
   {
     guint16 mask = 0;
 
-    gum_thumb_writer_put_instruction (self, wide_template);
-
     for (reg_index = 0; reg_index != n_regs; reg_index++)
     {
       const GumArmRegInfo * ri = &items[reg_index];
@@ -773,7 +773,7 @@ gum_thumb_writer_put_push_or_pop_regs (GumThumbWriter * self,
       mask |= (1 << ri->index);
     }
 
-    gum_thumb_writer_put_instruction (self, mask);
+    gum_thumb_writer_put_instruction_wide (self, wide_template, mask);
   }
   else
   {
@@ -1155,8 +1155,7 @@ gum_thumb_writer_put_mov_reg_cpsr (GumThumbWriter * self,
 
   gum_arm_reg_describe (reg, &ri);
 
-  gum_thumb_writer_put_instruction (self, 0xf3ef);
-  gum_thumb_writer_put_instruction (self, 0x8000 | ri.index << 8);
+  gum_thumb_writer_put_instruction_wide (self, 0xf3ef, 0x8000 | ri.index << 8);
 }
 
 void
@@ -1167,8 +1166,7 @@ gum_thumb_writer_put_mov_cpsr_reg (GumThumbWriter * self,
 
   gum_arm_reg_describe (reg, &ri);
 
-  gum_thumb_writer_put_instruction (self, 0xf380 | ri.index);
-  gum_thumb_writer_put_instruction (self, 0x8900);
+  gum_thumb_writer_put_instruction_wide (self, 0xf380 | ri.index, 0x8900);
 }
 
 gboolean
@@ -1313,7 +1311,8 @@ gum_thumb_writer_put_add_reg_reg_imm (GumThumbWriter * self,
 static void
 gum_thumb_writer_put_it_al (GumThumbWriter * self)
 {
-  gum_thumb_writer_put_instruction (self, 0xbfe8);
+  *self->code++ = GUINT16_TO_LE (0xbfe8);
+  self->pc += 2;
 }
 
 gboolean
@@ -1726,21 +1725,51 @@ static void
 gum_thumb_writer_maybe_commit_literals (GumThumbWriter * self)
 {
   gsize space_used;
-  gconstpointer after_literals = self->code;
+  guint16 * branch;
 
   if (self->earliest_literal_insn == NULL)
     return;
 
   space_used = (self->code - self->earliest_literal_insn) * sizeof (guint16);
   space_used += self->literal_refs.length * sizeof (guint32);
-  if (space_used <= 1024)
+  if (space_used <= 746)
+    return;
+
+  if (gum_thumb_writer_has_unresolved_short_branches (self))
     return;
 
   self->earliest_literal_insn = NULL;
 
-  gum_thumb_writer_put_b_label (self, after_literals);
+  branch = self->code;
+  gum_thumb_writer_put_instruction (self, 0xe000);
   gum_thumb_writer_commit_literals (self);
-  gum_thumb_writer_put_label (self, after_literals);
+  *branch = GUINT16_TO_LE (0xe000 | (self->code - branch - 2));
+}
+
+static gboolean
+gum_thumb_writer_has_unresolved_short_branches (GumThumbWriter * self)
+{
+  guint ref_index;
+
+  if (!gum_thumb_writer_has_label_refs (self))
+    return FALSE;
+
+  for (ref_index = 0; ref_index != self->label_refs.length; ref_index++)
+  {
+    GumThumbLabelRef * r;
+
+    r = gum_metal_array_element_at (&self->label_refs, ref_index);
+    if (r->type != GUM_THUMB_B_T1 &&
+        r->type != GUM_THUMB_CBZ_T1 &&
+        r->type != GUM_THUMB_CBNZ_T1)
+      continue;
+
+    if (!gum_thumb_writer_has_label_defs (self) ||
+        gum_metal_hash_table_lookup (self->label_defs, r->id) == NULL)
+      return TRUE;
+  }
+
+  return FALSE;
 }
 
 static void
@@ -1756,6 +1785,8 @@ gum_thumb_writer_commit_literals (GumThumbWriter * self)
   num_refs = self->literal_refs.length;
   if (num_refs == 0)
     return;
+
+  self->earliest_literal_insn = NULL;
 
   need_alignment_padding = (self->pc & 3) != 0;
   if (need_alignment_padding)

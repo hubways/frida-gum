@@ -22,8 +22,23 @@ TESTLIST_BEGIN (api_resolver)
   TESTENTRY (objc_method_can_be_resolved_from_instance_method_address)
 #endif
   TESTENTRY (swift_functions_in_libswiftcore_can_be_resolved)
+#if defined (HAVE_DARWIN) || defined (HAVE_ELF)
+  TESTENTRY (swift_functions_in_symbol_table_can_be_resolved)
+  TESTENTRY (swift_exported_functions_in_libswiftcore_are_listed_once)
+#endif
   TESTENTRY (swift_conformances_in_libswiftcore_can_be_resolved)
   TESTENTRY (swift_types_and_protocols_in_libswiftcore_can_be_resolved)
+  TESTENTRY (swift_vtable_slots_in_libswiftcore_are_named_from_dispatch_thunks)
+#if defined (HAVE_ARM64) || (defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 8)
+  TESTENTRY (swift_async_dispatch_thunk_names_its_slot)
+  TESTENTRY (swift_async_dispatch_thunk_via_indirect_pointer_names_its_slot)
+#endif
+#ifdef HAVE_ARM64
+  TESTENTRY (swift_async_dispatch_thunk_with_ptrauth_names_its_slot)
+  TESTENTRY (swift_dispatch_thunk_with_resilient_superclass_names_its_slot)
+  TESTENTRY (swift_class_method_thunk_with_resilient_superclass_names_its_slot)
+  TESTENTRY (swift_devirtualized_dispatch_thunk_names_no_slot)
+#endif
 #ifdef HAVE_ANDROID
   TESTENTRY (linker_exports_can_be_resolved_on_android)
 #endif
@@ -369,12 +384,24 @@ TESTCASE (objc_method_can_be_resolved_from_instance_method_address)
 # endif
 #endif
 
+#ifdef HAVE_QNX
+# define GUM_TESTS_PING_LABEL \
+    G_STRINGIFY (__USER_LABEL_PREFIX__) "$s8GumTests4pingyyF"
+#else
+# define GUM_TESTS_PING_LABEL \
+    "\"" G_STRINGIFY (__USER_LABEL_PREFIX__) "$s8GumTests4pingyyF\""
+#endif
+
 static gpointer open_swift_core (void);
 static GumAddress find_swift_core_export (gpointer swift_core,
     const gchar * name);
 static void close_swift_core (gpointer swift_core);
 #ifdef HAVE_ELF
 static void * open_swift_core_from_toolchain_in_path (void);
+#endif
+#if defined (HAVE_DARWIN) || defined (HAVE_ELF)
+static void gum_tests_ping (void)
+    __asm__ (GUM_TESTS_PING_LABEL);
 #endif
 
 TESTCASE (swift_functions_in_libswiftcore_can_be_resolved)
@@ -494,6 +521,86 @@ resolve_method_impl (const GumApiDetails * details,
 
   return FALSE;
 }
+
+#if defined (HAVE_DARWIN) || defined (HAVE_ELF)
+
+TESTCASE (swift_functions_in_symbol_table_can_be_resolved)
+{
+  gpointer swift_core;
+  TestForEachContext ctx;
+  GumAddress address;
+  GError * error = NULL;
+
+  if (gum_module_find_symbol_by_name (gum_process_get_main_module (),
+      "$s8GumTests4pingyyF") == 0)
+  {
+    g_test_skip ("Test binary is stripped");
+    return;
+  }
+
+  swift_core = open_swift_core ();
+  if (swift_core == NULL)
+  {
+    g_test_skip ("Swift runtime not available");
+    return;
+  }
+
+  fixture->resolver = gum_api_resolver_make ("swift");
+  g_assert_nonnull (fixture->resolver);
+
+  ctx.number_of_calls = 0;
+  ctx.value_to_return = TRUE;
+  gum_api_resolver_enumerate_matches (fixture->resolver,
+      "functions:*gum-tests*!GumTests.ping() -> ()", match_found_cb, &ctx,
+      &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (ctx.number_of_calls, ==, 1);
+
+  address = 0;
+  gum_api_resolver_enumerate_matches (fixture->resolver,
+      "functions:*gum-tests*!GumTests.ping() -> ()", resolve_method_impl,
+      &address, &error);
+  g_assert_no_error (error);
+  g_assert_cmphex (gum_strip_code_address (address), ==,
+      gum_strip_code_address (GUM_ADDRESS (gum_tests_ping)));
+
+  close_swift_core (swift_core);
+}
+
+TESTCASE (swift_exported_functions_in_libswiftcore_are_listed_once)
+{
+  gpointer swift_core;
+  TestForEachContext ctx;
+  GError * error = NULL;
+
+  swift_core = open_swift_core ();
+  if (swift_core == NULL)
+  {
+    g_test_skip ("Swift runtime not available");
+    return;
+  }
+
+  fixture->resolver = gum_api_resolver_make ("swift");
+  g_assert_nonnull (fixture->resolver);
+
+  ctx.number_of_calls = 0;
+  ctx.value_to_return = TRUE;
+  gum_api_resolver_enumerate_matches (fixture->resolver,
+      "functions:*swiftCore*!Swift.String.hasPrefix(Swift.String) -> "
+      "Swift.Bool",
+      match_found_cb, &ctx, &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (ctx.number_of_calls, ==, 1);
+
+  close_swift_core (swift_core);
+}
+
+static void
+gum_tests_ping (void)
+{
+}
+
+#endif
 
 TESTCASE (swift_conformances_in_libswiftcore_can_be_resolved)
 {
@@ -623,6 +730,233 @@ TESTCASE (swift_types_and_protocols_in_libswiftcore_can_be_resolved)
 
   close_swift_core (swift_core);
 }
+
+TESTCASE (swift_vtable_slots_in_libswiftcore_are_named_from_dispatch_thunks)
+{
+  gpointer swift_core;
+  GumAddress expected_address, address;
+  GHashTable * matches;
+  GError * error = NULL;
+
+  swift_core = open_swift_core ();
+  if (swift_core == NULL)
+  {
+    g_test_skip ("Swift runtime not available");
+    return;
+  }
+
+  expected_address = find_swift_core_export (swift_core,
+      "$ss13ManagedBufferC12_doNotCallMeAByxq_Gyt_tcfC");
+  g_assert_cmpuint (expected_address, !=, 0);
+
+  fixture->resolver = gum_api_resolver_make ("swift");
+  g_assert_nonnull (fixture->resolver);
+
+  address = 0;
+  gum_api_resolver_enumerate_matches (fixture->resolver,
+      "functions:*swiftCore*!dispatch thunk of *", resolve_method_impl,
+      &address, &error);
+  g_assert_no_error (error);
+  if (address == 0)
+  {
+    g_test_skip ("Swift runtime exports no dispatch thunks");
+    close_swift_core (swift_core);
+    return;
+  }
+
+  address = 0;
+  gum_api_resolver_enumerate_matches (fixture->resolver,
+      "functions:*swiftCore*!Swift.ManagedBuffer.__allocating_init"
+      "(_doNotCallMe: ())*",
+      resolve_method_impl, &address, &error);
+  g_assert_no_error (error);
+  g_assert_cmphex (gum_strip_code_address (address), ==,
+      gum_strip_code_address (expected_address));
+
+  matches = make_match_table ();
+  gum_api_resolver_enumerate_matches (fixture->resolver,
+      "functions:*swiftCore*!Swift.ManagedBuffer.vtable[*", collect_match,
+      matches, &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (g_hash_table_size (matches), ==, 0);
+  g_hash_table_unref (matches);
+
+  close_swift_core (swift_core);
+}
+
+#ifdef HAVE_ARM64
+
+TESTCASE (swift_async_dispatch_thunk_names_its_slot)
+{
+  const guint32 thunk[] = {
+    GUINT32_TO_LE (0xb24403bd), GUINT32_TO_LE (0xd10083ff),
+    GUINT32_TO_LE (0xa9017bfd), GUINT32_TO_LE (0xf90007f6),
+    GUINT32_TO_LE (0x910043fd), GUINT32_TO_LE (0xf9400288),
+    GUINT32_TO_LE (0xf9407108), GUINT32_TO_LE (0x29400109),
+    GUINT32_TO_LE (0x93407d29), GUINT32_TO_LE (0x8b080121),
+    GUINT32_TO_LE (0xf90003e1), GUINT32_TO_LE (0x94000065),
+    GUINT32_TO_LE (0xf9000ac0), GUINT32_TO_LE (0x90000008),
+    GUINT32_TO_LE (0x91307108), GUINT32_TO_LE (0xa9002016),
+    GUINT32_TO_LE (0xaa0003f6), GUINT32_TO_LE (0xf94003e0),
+    GUINT32_TO_LE (0xa9417bfd), GUINT32_TO_LE (0x9243fbbd),
+    GUINT32_TO_LE (0x910083ff), GUINT32_TO_LE (0xd61f0000),
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (thunk),
+      ==, 28);
+}
+
+TESTCASE (swift_async_dispatch_thunk_via_indirect_pointer_names_its_slot)
+{
+  const guint32 thunk[] = {
+    GUINT32_TO_LE (0xf81f0ffe), GUINT32_TO_LE (0xf9400288),
+    GUINT32_TO_LE (0xf9406508), GUINT32_TO_LE (0x927ff909),
+    GUINT32_TO_LE (0xf240011f), GUINT32_TO_LE (0xf9400129),
+    GUINT32_TO_LE (0x9a890108), GUINT32_TO_LE (0x29400109),
+    GUINT32_TO_LE (0x93407d29), GUINT32_TO_LE (0x8b090101),
+    GUINT32_TO_LE (0x90000008), GUINT32_TO_LE (0xf90007e1),
+    GUINT32_TO_LE (0xf9400108), GUINT32_TO_LE (0xd63f0100),
+    GUINT32_TO_LE (0x90000008), GUINT32_TO_LE (0x91000108),
+    GUINT32_TO_LE (0xf9000ac0), GUINT32_TO_LE (0xa9002016),
+    GUINT32_TO_LE (0xaa0003f6), GUINT32_TO_LE (0xf94007e0),
+    GUINT32_TO_LE (0xf84107fe), GUINT32_TO_LE (0xd61f0000),
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (thunk),
+      ==, 25);
+}
+
+TESTCASE (swift_async_dispatch_thunk_with_ptrauth_names_its_slot)
+{
+  const guint32 thunk[] = {
+    GUINT32_TO_LE (0xd503237f), GUINT32_TO_LE (0xb24403bd),
+    GUINT32_TO_LE (0xd100c3ff), GUINT32_TO_LE (0xa9027bfd),
+    GUINT32_TO_LE (0x910063f0), GUINT32_TO_LE (0xf2f86350),
+    GUINT32_TO_LE (0xaa1603f1), GUINT32_TO_LE (0xdac10e11),
+    GUINT32_TO_LE (0xf9000ff1), GUINT32_TO_LE (0x910083fd),
+    GUINT32_TO_LE (0xf9400290), GUINT32_TO_LE (0xaa1403f1),
+    GUINT32_TO_LE (0xf2ed5c31), GUINT32_TO_LE (0xdac11a30),
+    GUINT32_TO_LE (0xf84e0e08), GUINT32_TO_LE (0xaa1003e0),
+    GUINT32_TO_LE (0xf90007f0), GUINT32_TO_LE (0xaa0803f0),
+    GUINT32_TO_LE (0xaa0003f1), GUINT32_TO_LE (0xf2f14331),
+    GUINT32_TO_LE (0xdac11a30), GUINT32_TO_LE (0xaa1003f1),
+    GUINT32_TO_LE (0xdac147f1), GUINT32_TO_LE (0xeb11021f),
+    GUINT32_TO_LE (0x54000040), GUINT32_TO_LE (0xd4388e40),
+    GUINT32_TO_LE (0xb8800e11), GUINT32_TO_LE (0x8b110210),
+    GUINT32_TO_LE (0xaa0003f1), GUINT32_TO_LE (0xf2f14331),
+    GUINT32_TO_LE (0xdac10230), GUINT32_TO_LE (0xf9000bf0),
+    GUINT32_TO_LE (0xaa0803f0), GUINT32_TO_LE (0xaa0003f1),
+    GUINT32_TO_LE (0xf2f14331), GUINT32_TO_LE (0xdac11a30),
+    GUINT32_TO_LE (0xaa1003f1), GUINT32_TO_LE (0xdac147f1),
+    GUINT32_TO_LE (0xeb11021f), GUINT32_TO_LE (0x54000040),
+    GUINT32_TO_LE (0xd4388e40), GUINT32_TO_LE (0xb9400600),
+    GUINT32_TO_LE (0x94000121), GUINT32_TO_LE (0xaa1603f1),
+    GUINT32_TO_LE (0xf9000ac0), GUINT32_TO_LE (0xaa0003f0),
+    GUINT32_TO_LE (0xf2f7b450), GUINT32_TO_LE (0xdac10a11),
+    GUINT32_TO_LE (0xf9000011), GUINT32_TO_LE (0x91002008),
+    GUINT32_TO_LE (0xb0000010), GUINT32_TO_LE (0x91032210),
+    GUINT32_TO_LE (0xaa0803f1), GUINT32_TO_LE (0xf2fae0f1),
+    GUINT32_TO_LE (0xdac10230), GUINT32_TO_LE (0xf9000410),
+    GUINT32_TO_LE (0xaa0003f6), GUINT32_TO_LE (0xa94083e1),
+    GUINT32_TO_LE (0xa9427bfd), GUINT32_TO_LE (0x9243fbbd),
+    GUINT32_TO_LE (0x9100c3ff), GUINT32_TO_LE (0xd50323ff),
+    GUINT32_TO_LE (0xca1e07d0), GUINT32_TO_LE (0xb6f00050),
+    GUINT32_TO_LE (0xd4388e20), GUINT32_TO_LE (0xaa0103f0),
+    GUINT32_TO_LE (0xf2f14330), GUINT32_TO_LE (0xd71f0810),
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (thunk),
+      ==, 28);
+}
+
+TESTCASE (swift_dispatch_thunk_with_resilient_superclass_names_its_slot)
+{
+  const guint32 thunk[] = {
+    GUINT32_TO_LE (0xf9400288), GUINT32_TO_LE (0x90000049),
+    GUINT32_TO_LE (0xf9406929), GUINT32_TO_LE (0x8b090108),
+    GUINT32_TO_LE (0xf9400d00), GUINT32_TO_LE (0xd61f0000),
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (thunk),
+      ==, 3);
+}
+
+TESTCASE (swift_class_method_thunk_with_resilient_superclass_names_its_slot)
+{
+  const guint32 thunk[] = {
+    GUINT32_TO_LE (0xb24403bd), GUINT32_TO_LE (0xd10083ff),
+    GUINT32_TO_LE (0xa9017bfd), GUINT32_TO_LE (0xf90007f6),
+    GUINT32_TO_LE (0x910043fd), GUINT32_TO_LE (0x90000048),
+    GUINT32_TO_LE (0xf9406908), GUINT32_TO_LE (0x8b080288),
+    GUINT32_TO_LE (0xf9400908), GUINT32_TO_LE (0x29400109),
+    GUINT32_TO_LE (0x93407d29), GUINT32_TO_LE (0x8b080121),
+    GUINT32_TO_LE (0xf90003e1), GUINT32_TO_LE (0x940000ae),
+    GUINT32_TO_LE (0xf9000ac0), GUINT32_TO_LE (0x90000008),
+    GUINT32_TO_LE (0x91398108), GUINT32_TO_LE (0xa9002016),
+    GUINT32_TO_LE (0xaa0003f6), GUINT32_TO_LE (0xf94003e0),
+    GUINT32_TO_LE (0xa9417bfd), GUINT32_TO_LE (0x9243fbbd),
+    GUINT32_TO_LE (0x910083ff), GUINT32_TO_LE (0xd61f0000),
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (thunk),
+      ==, 2);
+}
+
+TESTCASE (swift_devirtualized_dispatch_thunk_names_no_slot)
+{
+  const guint32 thunk_and_next_function[] = {
+    GUINT32_TO_LE (0x1400048d), GUINT32_TO_LE (0xf9400288),
+    GUINT32_TO_LE (0xf9406d00), GUINT32_TO_LE (0xd61f0000),
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (
+      thunk_and_next_function), ==, -1);
+}
+
+#elif defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 8
+
+TESTCASE (swift_async_dispatch_thunk_names_its_slot)
+{
+  const guint8 thunk[] = {
+    0x48, 0x0f, 0xba, 0xed, 0x3c, 0x55, 0x41, 0x56,
+    0x48, 0x8d, 0x6c, 0x24, 0x08, 0x48, 0x83, 0xec,
+    0x08, 0x53, 0x48, 0x83, 0xec, 0x18, 0x49, 0x8b,
+    0x45, 0x00, 0x48, 0x8b, 0x80, 0xe0, 0x00, 0x00,
+    0x00, 0x48, 0x63, 0x08, 0x48, 0x01, 0xc1, 0x48,
+    0x89, 0xcb, 0x8b, 0x78, 0x04, 0xe8, 0xc4, 0x01,
+    0x00, 0x00, 0x49, 0x89, 0x46, 0x10, 0x4c, 0x89,
+    0x30, 0x48, 0x8d, 0x0d, 0x80, 0x01, 0x00, 0x00,
+    0x48, 0x89, 0x48, 0x08, 0x49, 0x89, 0xc6, 0x48,
+    0x89, 0xd8, 0x48, 0x83, 0xc4, 0x18, 0x5b, 0x48,
+    0x83, 0xc4, 0x10, 0x5d, 0x48, 0x0f, 0xba, 0xf5,
+    0x3c, 0xff, 0xe0,
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (thunk),
+      ==, 28);
+}
+
+TESTCASE (swift_async_dispatch_thunk_via_indirect_pointer_names_its_slot)
+{
+  const guint8 thunk[] = {
+    0x56, 0x48, 0x83, 0xec, 0x30, 0x4c, 0x89, 0x74,
+    0x24, 0x28, 0x49, 0x8b, 0x45, 0x00, 0x48, 0x8b,
+    0x80, 0xc8, 0x00, 0x00, 0x00, 0xa8, 0x01, 0x74,
+    0x07, 0x48, 0x83, 0xe0, 0xfe, 0x48, 0x8b, 0x00,
+    0x48, 0x63, 0x08, 0x48, 0x01, 0xc1, 0x48, 0x89,
+    0xce, 0x8b, 0x48, 0x04, 0xff, 0x15, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x89, 0x46, 0x10, 0x4c, 0x89,
+    0x30, 0x48, 0x8d, 0x0d, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x89, 0x48, 0x08, 0x49, 0x89, 0xc6, 0x48,
+    0x89, 0xf0, 0x48, 0x83, 0xc4, 0x30, 0x5e, 0x48,
+    0xff, 0xe0,
+  };
+
+  g_assert_cmpint (_gum_swift_api_resolver_find_vtable_index_in_thunk (thunk),
+      ==, 25);
+}
+
+#endif
 
 #ifdef HAVE_ANDROID
 
