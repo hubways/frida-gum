@@ -74,6 +74,7 @@ TESTLIST_BEGIN (script)
   TESTGROUP_BEGIN ("WeakRef")
     TESTENTRY (weak_ref_api_should_be_supported)
     TESTENTRY (weak_callback_is_triggered_on_gc)
+    TESTENTRY (weak_callback_is_triggered_on_automatic_gc)
     TESTENTRY (weak_callback_is_triggered_on_unload)
     TESTENTRY (weak_callback_is_triggered_on_unbind)
     TESTENTRY (weak_callback_should_not_be_exclusive)
@@ -5605,7 +5606,7 @@ TESTCASE (basic_block_can_be_invalidated_for_current_thread)
   target_function_int_addr =
       GSIZE_TO_POINTER (GPOINTER_TO_SIZE (target_function_int) & ~1);
 #else
-  target_function_int_addr = target_function_int;
+  target_function_int_addr = gum_strip_code_pointer (target_function_int);
 #endif
 
   COMPILE_AND_LOAD_SCRIPT (
@@ -5714,7 +5715,7 @@ TESTCASE (basic_block_can_be_invalidated_for_specific_thread)
   target_function_int_addr =
       GSIZE_TO_POINTER (GPOINTER_TO_SIZE (target_function_int) & ~1);
 #else
-  target_function_int_addr = target_function_int;
+  target_function_int_addr = gum_strip_code_pointer (target_function_int);
 #endif
 
   COMPILE_AND_LOAD_SCRIPT (
@@ -9557,7 +9558,7 @@ TESTCASE (memory_access_monitor_provides_cpu_context)
   COMPILE_AND_LOAD_SCRIPT (
       "MemoryAccessMonitor.enable({ base: " GUM_PTR_CONST ", size: %u }, {"
         "onAccess(details) {"
-          "send([details.context.pc.equals(details.from),"
+          "send([details.context.pc.strip().equals(details.from),"
             "details.context.sp.isNull()]);"
         "}"
       "});",
@@ -12083,6 +12084,25 @@ TESTCASE (weak_callback_is_triggered_on_gc)
       "  send(\"weak notify\");"
       "}"
       "gc();");
+  EXPECT_SEND_MESSAGE_WITH ("\"weak notify\"");
+  EXPECT_NO_MESSAGES ();
+}
+
+TESTCASE (weak_callback_is_triggered_on_automatic_gc)
+{
+  COMPILE_AND_LOAD_SCRIPT (
+      "(() => {"
+      "  const val = {};"
+      "  val.self = val;"
+      "  Script.bindWeak(val, onWeakNotify);"
+      "})();"
+      "function onWeakNotify() {"
+      "  send(\"weak notify\");"
+      "}"
+      "for (let i = 0; i !== 100000; i++) {"
+      "  const garbage = {};"
+      "  garbage.self = garbage;"
+      "}");
   EXPECT_SEND_MESSAGE_WITH ("\"weak notify\"");
   EXPECT_NO_MESSAGES ();
 }
