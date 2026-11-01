@@ -487,6 +487,44 @@ gum_memory_write (gpointer address,
 }
 
 gboolean
+_gum_try_read_process_memory (pid_t pid,
+                              GumAddress address,
+                              gpointer buffer,
+                              gsize size)
+{
+  struct iovec local = {
+    .iov_base = buffer,
+    .iov_len = size
+  };
+  struct iovec remote = {
+    .iov_base = GSIZE_TO_POINTER (address),
+    .iov_len = size
+  };
+
+  return gum_libc_process_vm_readv (pid, &local, 1, &remote, 1, 0) ==
+      (gssize) size;
+}
+
+gboolean
+_gum_try_write_process_memory (pid_t pid,
+                               GumAddress address,
+                               gconstpointer data,
+                               gsize size)
+{
+  struct iovec local = {
+    .iov_base = (void *) data,
+    .iov_len = size
+  };
+  struct iovec remote = {
+    .iov_base = GSIZE_TO_POINTER (address),
+    .iov_len = size
+  };
+
+  return gum_libc_process_vm_writev (pid, &local, 1, &remote, 1, 0) ==
+      (gssize) size;
+}
+
+gboolean
 gum_memory_can_remap_writable (void)
 {
   return FALSE;
@@ -523,6 +561,10 @@ gum_try_mprotect (gpointer address,
       GPOINTER_TO_SIZE (address) & ~(page_size - 1));
   aligned_size =
       (1 + ((address + size - 1 - aligned_address) / page_size)) * page_size;
+
+  if (_gum_memory_is_protection_hooked ())
+    return _gum_memory_protect_via_hooks (aligned_address, aligned_size, prot);
+
   posix_prot = _gum_page_protection_to_posix (prot);
 
   result = mprotect (aligned_address, aligned_size, posix_prot);

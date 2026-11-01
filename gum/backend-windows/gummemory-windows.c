@@ -13,10 +13,24 @@
 
 #include <stdlib.h>
 
+typedef struct _GumSectionView GumSectionView;
+
+struct _GumSectionView
+{
+  gpointer base;
+  gsize size;
+  HANDLE section;
+  guint64 offset;
+};
+
 static gpointer gum_virtual_alloc (gpointer address, gsize size,
     DWORD allocation_type, DWORD page_protection);
 static gboolean gum_memory_get_protection (gconstpointer address, gsize len,
     GumPageProtection * prot);
+static void gum_section_view_free (GumSectionView * view);
+
+static GMutex gum_section_views_lock;
+static GSList * gum_section_views = NULL;
 
 void
 _gum_memory_backend_init (void)
@@ -149,6 +163,9 @@ gum_try_mprotect (gpointer address,
 {
   DWORD win_prot, old_protect;
 
+  if (_gum_memory_is_protection_hooked ())
+    return _gum_memory_protect_via_hooks (address, size, prot);
+
   win_prot = gum_page_protection_to_windows (prot);
 
   return VirtualProtect (address, size, win_prot, &old_protect);
@@ -171,6 +188,9 @@ gum_memory_allocate (gpointer address,
   gpointer base, aligned_base;
   gsize padded_size;
   gint retries = 3;
+
+  if (_gum_memory_is_allocation_hooked (prot))
+    return _gum_memory_allocate_via_hooks (NULL, size, alignment, prot);
 
   allocation_type = (prot == GUM_PAGE_NO_ACCESS)
       ? MEM_RESERVE
@@ -215,10 +235,15 @@ gum_memory_allocate_near (const GumAddressSpec * spec,
                           gsize alignment,
                           GumPageProtection prot)
 {
-  gpointer result = NULL;
-  gsize page_size, step_size;
+  gpointer result;
+  SYSTEM_INFO si;
+  gsize step_size;
   DWORD win_prot;
-  guint8 * low_address, * high_address;
+  gsize near_address, min_address, max_address, low_address, high_address;
+
+  if (_gum_memory_is_allocation_hooked (prot))
+    return _gum_memory_allocate_via_hooks (spec, size, alignment,
+        prot);
 
   result = gum_memory_allocate (NULL, size, alignment, prot);
   if (result == NULL)
@@ -227,35 +252,52 @@ gum_memory_allocate_near (const GumAddressSpec * spec,
     return result;
   gum_memory_free (result, size);
 
-  page_size = gum_query_page_size ();
-  step_size = MAX (page_size, GUM_ALIGN_SIZE (alignment, page_size));
+  GetSystemInfo (&si);
+  step_size = MAX (si.dwAllocationGranularity,
+      GUM_ALIGN_SIZE (alignment, si.dwAllocationGranularity));
   win_prot = gum_page_protection_to_windows (prot);
 
-  low_address = GSIZE_TO_POINTER (
-      (GPOINTER_TO_SIZE (spec->near_address) & ~(step_size - 1)));
+  near_address = GPOINTER_TO_SIZE (spec->near_address);
+  min_address = GPOINTER_TO_SIZE (si.lpMinimumApplicationAddress);
+  max_address = GPOINTER_TO_SIZE (si.lpMaximumApplicationAddress);
+  if (near_address > spec->max_distance)
+    min_address = MAX (min_address, near_address - spec->max_distance);
+  if (G_MAXSIZE - near_address >= spec->max_distance)
+    max_address = MIN (max_address, near_address + spec->max_distance);
+  if (min_address > max_address)
+    return NULL;
+
+  low_address = CLAMP (near_address, min_address, max_address) &
+      ~(step_size - 1);
   high_address = low_address;
 
-  do
+  while (TRUE)
   {
-    gsize cur_distance;
+    gboolean low_in_range, high_in_range;
 
-    low_address -= step_size;
-    high_address += step_size;
-    cur_distance = (gsize) high_address - (gsize) spec->near_address;
-    if (cur_distance > spec->max_distance)
-      break;
+    low_in_range = low_address >= min_address;
+    high_in_range = max_address - high_address >= step_size;
+    if (!low_in_range && !high_in_range)
+      return NULL;
 
-    result = VirtualAlloc (low_address, size, MEM_COMMIT | MEM_RESERVE,
-        win_prot);
-    if (result == NULL)
+    if (low_in_range)
     {
-      result = VirtualAlloc (high_address, size, MEM_COMMIT | MEM_RESERVE,
-          win_prot);
+      result = VirtualAlloc (GSIZE_TO_POINTER (low_address), size,
+          MEM_COMMIT | MEM_RESERVE, win_prot);
+      if (result != NULL)
+        return result;
+      low_address -= step_size;
+    }
+
+    if (high_in_range)
+    {
+      high_address += step_size;
+      result = VirtualAlloc (GSIZE_TO_POINTER (high_address), size,
+          MEM_COMMIT | MEM_RESERVE, win_prot);
+      if (result != NULL)
+        return result;
     }
   }
-  while (result == NULL);
-
-  return result;
 }
 
 static gpointer
@@ -395,6 +437,94 @@ gum_memory_get_protection (gconstpointer address,
     *prot = gum_page_protection_from_windows (mbi.Protect);
 
   return success;
+}
+
+GBytes *
+gum_windows_bytes_new_from_section (HANDLE section,
+                                    guint64 offset,
+                                    gsize size,
+                                    GError ** error)
+{
+  HANDLE own_section;
+  gpointer base;
+  GumSectionView * view;
+
+  if (!DuplicateHandle (GetCurrentProcess (), section, GetCurrentProcess (),
+      &own_section, 0, FALSE, DUPLICATE_SAME_ACCESS))
+  {
+    goto failure;
+  }
+
+  base = MapViewOfFile (own_section, FILE_MAP_READ, (DWORD) (offset >> 32),
+      (DWORD) offset, size);
+  if (base == NULL)
+  {
+    CloseHandle (own_section);
+    goto failure;
+  }
+
+  view = g_slice_new (GumSectionView);
+  view->base = base;
+  view->size = size;
+  view->section = own_section;
+  view->offset = offset;
+
+  g_mutex_lock (&gum_section_views_lock);
+  gum_section_views = g_slist_prepend (gum_section_views, view);
+  g_mutex_unlock (&gum_section_views_lock);
+
+  return g_bytes_new_with_free_func (base, size,
+      (GDestroyNotify) gum_section_view_free, view);
+
+failure:
+  {
+    g_set_error (error, GUM_ERROR, GUM_ERROR_FAILED,
+        "Unable to map section: 0x%08lx", GetLastError ());
+    return NULL;
+  }
+}
+
+static void
+gum_section_view_free (GumSectionView * view)
+{
+  g_mutex_lock (&gum_section_views_lock);
+  gum_section_views = g_slist_remove (gum_section_views, view);
+  g_mutex_unlock (&gum_section_views_lock);
+
+  UnmapViewOfFile (view->base);
+  CloseHandle (view->section);
+
+  g_slice_free (GumSectionView, view);
+}
+
+gboolean
+_gum_windows_find_section_view (gconstpointer data,
+                                gpointer * section,
+                                guint64 * offset)
+{
+  gboolean found = FALSE;
+  const guint8 * address = data;
+  GSList * cur;
+
+  g_mutex_lock (&gum_section_views_lock);
+
+  for (cur = gum_section_views; cur != NULL; cur = cur->next)
+  {
+    GumSectionView * view = cur->data;
+    const guint8 * base = view->base;
+
+    if (address >= base && address < base + view->size)
+    {
+      *section = view->section;
+      *offset = view->offset + (address - base);
+      found = TRUE;
+      break;
+    }
+  }
+
+  g_mutex_unlock (&gum_section_views_lock);
+
+  return found;
 }
 
 GumPageProtection

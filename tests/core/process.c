@@ -48,6 +48,7 @@ TESTLIST_BEGIN (process)
   TESTENTRY (process_threads)
   TESTENTRY (process_threads_exclude_cloaked)
   TESTENTRY (process_threads_should_include_name)
+  TESTENTRY (main_module_is_the_executable)
   TESTENTRY (process_modules)
   TESTENTRY (process_ranges)
   TESTENTRY (process_ranges_exclude_cloaked)
@@ -72,9 +73,14 @@ TESTLIST_BEGIN (process)
 #ifndef HAVE_ASAN
   TESTENTRY (module_export_matches_system_lookup)
 #endif
+#if defined (HAVE_LINUX) && defined (__GLIBC__)
+  TESTENTRY (module_exports_exclude_hidden_versions)
+  TESTENTRY (elf_module_soname_is_exposed)
+#endif
 #ifdef HAVE_WINDOWS
   TESTENTRY (get_set_system_error)
   TESTENTRY (get_current_thread_id)
+  TESTENTRY (windows_modules_are_in_load_order)
 #endif
 #ifdef HAVE_DARWIN
   TESTENTRY (darwin_enumerate_modules)
@@ -193,6 +199,10 @@ static gboolean store_import_details_if_test_symbol (
 #ifndef HAVE_WINDOWS
 static gboolean store_export_address_if_tricky_module_export (
     const GumExportDetails * details, gpointer user_data);
+#endif
+#if defined (HAVE_LINUX) && defined (__GLIBC__)
+static gboolean check_export_name_is_unique (const GumExportDetails * details,
+    gpointer user_data);
 #endif
 
 #ifdef HAVE_DARWIN
@@ -407,6 +417,16 @@ check_thread_enumeration_testable (void)
   }
 
   return TRUE;
+}
+
+TESTCASE (main_module_is_the_executable)
+{
+  GumModule * module;
+
+  module = gum_process_get_main_module ();
+
+  g_assert_true (g_str_has_prefix (gum_module_get_name (module),
+      "gum-tests"));
 }
 
 TESTCASE (process_modules)
@@ -1182,7 +1202,7 @@ TESTCASE (module_export_can_be_found)
   g_assert_true (gum_module_find_export_by_name (module,
       SYSTEM_MODULE_EXPORT) != 0);
 
-#ifdef HAVE_WINDOWS
+#if defined (HAVE_WINDOWS) && GLIB_SIZEOF_VOID_P == 8
   g_assert_true (gum_module_find_export_by_name (module,
       "KiUserInvertedFunctionTable") != 0);
 #endif
@@ -1239,7 +1259,52 @@ store_export_address_if_tricky_module_export (const GumExportDetails * details,
 
 #endif
 
+#if defined (HAVE_LINUX) && defined (__GLIBC__)
+
+TESTCASE (module_exports_exclude_hidden_versions)
+{
+  GumModule * libc;
+  GHashTable * names;
+
+  libc = gum_process_get_libc_module ();
+  names = g_hash_table_new (g_str_hash, g_str_equal);
+
+  gum_module_enumerate_exports (libc, check_export_name_is_unique, names);
+  g_assert_cmpuint (g_hash_table_size (names), >, 0);
+
+  g_hash_table_unref (names);
+}
+
+TESTCASE (elf_module_soname_is_exposed)
+{
+  GumElfModule * libc;
+
+  libc = gum_elf_module_new_from_file (
+      gum_module_get_path (gum_process_get_libc_module ()), NULL);
+  g_assert_nonnull (libc);
+
+  g_assert_cmpstr (gum_elf_module_get_soname (libc), ==, "libc.so.6");
+
+  g_object_unref (libc);
+}
+
+static gboolean
+check_export_name_is_unique (const GumExportDetails * details,
+                             gpointer user_data)
+{
+  GHashTable * names = user_data;
+
+  g_assert_true (g_hash_table_add (names, (gpointer) details->name));
+
+  return TRUE;
+}
+
+#endif
+
 #ifdef HAVE_WINDOWS
+
+static gboolean store_lowercase_module_name (GumModule * module,
+    gpointer user_data);
 
 TESTCASE (get_current_thread_id)
 {
@@ -1253,6 +1318,36 @@ TESTCASE (get_set_system_error)
   g_assert_cmpint (GetLastError (), ==, 0x12345678);
   SetLastError (0x89ABCDEF);
   g_assert_cmpint (gum_thread_get_system_error (), ==, (gint) 0x89ABCDEF);
+}
+
+TESTCASE (windows_modules_are_in_load_order)
+{
+  GPtrArray * names;
+  guint ntdll_index, kernel32_index;
+
+  names = g_ptr_array_new_with_free_func (g_free);
+  gum_process_enumerate_modules (store_lowercase_module_name, names);
+
+  g_assert_true (g_str_has_prefix (g_ptr_array_index (names, 0),
+      "gum-tests"));
+  g_assert_true (g_ptr_array_find_with_equal_func (names, "ntdll.dll",
+      g_str_equal, &ntdll_index));
+  g_assert_true (g_ptr_array_find_with_equal_func (names, "kernel32.dll",
+      g_str_equal, &kernel32_index));
+  g_assert_cmpuint (ntdll_index, <, kernel32_index);
+
+  g_ptr_array_unref (names);
+}
+
+static gboolean
+store_lowercase_module_name (GumModule * module,
+                             gpointer user_data)
+{
+  GPtrArray * names = user_data;
+
+  g_ptr_array_add (names, g_ascii_strdown (gum_module_get_name (module), -1));
+
+  return TRUE;
 }
 
 #endif
@@ -1491,7 +1586,7 @@ TESTCASE (darwin_module_resolver_should_resolve_chkstk)
 {
   mach_port_t task;
   GumDarwinModuleResolver * resolver;
-  GumDarwinModule * libsystem;
+  GumMachoModule * libsystem;
   GumExportDetails chkstk;
 
   task = gum_test_get_target_task ();
@@ -1499,7 +1594,7 @@ TESTCASE (darwin_module_resolver_should_resolve_chkstk)
   resolver = gum_darwin_module_resolver_new (task, NULL);
   g_assert_nonnull (resolver);
 
-  libsystem = gum_darwin_module_resolver_find_module_by_name (resolver,
+  libsystem = gum_darwin_module_resolver_find_macho_module_by_name (resolver,
       "/usr/lib/libSystem.B.dylib");
   g_assert_nonnull (libsystem);
 
@@ -1815,18 +1910,18 @@ export_found_cb (const GumExportDetails * details,
 
   ctx->number_of_calls++;
 
-#if defined (HAVE_DARWIN)
+#if defined (HAVE_WINDOWS)
+  if (strcmp (details->name, "NtClose") == 0)
+    g_assert_cmpint (details->type, ==, GUM_EXPORT_FUNCTION);
+  else if (strcmp (details->name, "KiUserInvertedFunctionTable") == 0)
+    g_assert_cmpint (details->type, ==, GUM_EXPORT_VARIABLE);
+#elif defined (HAVE_DARWIN)
   if (strcmp (details->name, "malloc") == 0)
     g_assert_cmpint (details->type, ==, GUM_EXPORT_FUNCTION);
   else if (g_str_has_prefix (details->name, "OBJC_CLASS_"))
     g_assert_cmpint (details->type, ==, GUM_EXPORT_VARIABLE);
   else if (strcmp (details->name, "dispatch_async_f") == 0)
     g_assert_cmpint (details->type, ==, GUM_EXPORT_FUNCTION);
-#elif defined (HAVE_WINDOWS)
-  if (strcmp (details->name, "NtClose") == 0)
-    g_assert_cmpint (details->type, ==, GUM_EXPORT_FUNCTION);
-  else if (strcmp (details->name, "KiUserInvertedFunctionTable") == 0)
-    g_assert_cmpint (details->type, ==, GUM_EXPORT_VARIABLE);
 #endif
 
   return ctx->value_to_return;

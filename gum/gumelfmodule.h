@@ -11,8 +11,8 @@
 
 G_BEGIN_DECLS
 
-#define GUM_ELF_TYPE_MODULE (gum_elf_module_get_type ())
-G_DECLARE_FINAL_TYPE (GumElfModule, gum_elf_module, GUM_ELF, MODULE, GObject)
+#define GUM_TYPE_ELF_MODULE (gum_elf_module_get_type ())
+G_DECLARE_FINAL_TYPE (GumElfModule, gum_elf_module, GUM, ELF_MODULE, GObject)
 
 typedef enum {
   GUM_ELF_NONE,
@@ -259,6 +259,7 @@ typedef enum {
   GUM_ELF_SECTION_SYMTAB_SHNDX,
   GUM_ELF_SECTION_RELR,
   GUM_ELF_SECTION_NUM,
+  GUM_ELF_SECTION_ANDROID_RELR   = 0x6fffff00,
   GUM_ELF_SECTION_GNU_ATTRIBUTES = 0x6ffffff5,
   GUM_ELF_SECTION_GNU_HASH       = 0x6ffffff6,
   GUM_ELF_SECTION_GNU_LIBLIST    = 0x6ffffff7,
@@ -992,6 +993,7 @@ GUM_API GumAddress gum_elf_module_get_preferred_address (GumElfModule * self);
 GUM_API guint64 gum_elf_module_get_mapped_size (GumElfModule * self);
 GUM_API GumAddress gum_elf_module_get_entrypoint (GumElfModule * self);
 GUM_API const gchar * gum_elf_module_get_interpreter (GumElfModule * self);
+GUM_API const gchar * gum_elf_module_get_soname (GumElfModule * self);
 GUM_API const gchar * gum_elf_module_get_source_path (GumElfModule * self);
 GUM_API GBytes * gum_elf_module_get_source_blob (GumElfModule * self);
 GUM_API GumElfSourceMode gum_elf_module_get_source_mode (GumElfModule * self);

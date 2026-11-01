@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2014-2026 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C)      2019 Jon Wilson <jonwilson@zepler.net>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -260,9 +260,11 @@ gum_mips_writer_flush (GumMipsWriter * self)
     /* beq <int16> */
     else if ((insn & 0xfc000000) == 0x10000000)
     {
-      if (!GUM_IS_WITHIN_INT18_RANGE (distance << 2))
+      gssize delay_slot_distance = distance - 1;
+
+      if (!GUM_IS_WITHIN_INT18_RANGE (delay_slot_distance << 2))
         goto error;
-      insn |= distance & GUM_INT16_MASK;
+      insn |= delay_slot_distance & GUM_INT16_MASK;
     }
     /* TODO: conditional branches */
     else if ((insn & 0x7e000000) == 0x36000000)
@@ -572,7 +574,7 @@ gum_mips_writer_put_beq_reg_reg_label (GumMipsWriter * self,
   gum_mips_writer_describe_reg (self, left_reg, &rt);
 
   gum_mips_writer_add_label_reference_here (self, label_id);
-  gum_mips_writer_put_instruction (self, 0x01000000 | (rs.index << 21) |
+  gum_mips_writer_put_instruction (self, 0x10000000 | (rs.index << 21) |
       (rt.index << 16));
   gum_mips_writer_put_nop (self);
 }
@@ -661,8 +663,8 @@ gum_mips_writer_put_ld_reg_reg_offset (GumMipsWriter * self,
   gum_mips_writer_describe_reg (self, dst_reg, &rd);
   gum_mips_writer_describe_reg (self, src_reg, &rs);
 
-  gum_mips_writer_put_instruction (self, 0x68000000 | (rs.index << 21) |
-      (rd.index << 16) | src_offset);
+  gum_mips_writer_put_instruction (self, 0xdc000000 | (rs.index << 21) |
+      (rd.index << 16) | (src_offset & 0xffff));
 }
 
 void
@@ -690,6 +692,21 @@ gum_mips_writer_put_lw_reg_reg_offset (GumMipsWriter * self,
       0x8c000000
 #endif
       | (rs.index << 21) | (rd.index << 16) | (src_offset & 0xffff));
+}
+
+void
+gum_mips_writer_put_lw32_reg_reg_offset (GumMipsWriter * self,
+                                         mips_reg dst_reg,
+                                         mips_reg src_reg,
+                                         gsize src_offset)
+{
+  GumMipsRegInfo rd, rs;
+
+  gum_mips_writer_describe_reg (self, dst_reg, &rd);
+  gum_mips_writer_describe_reg (self, src_reg, &rs);
+
+  gum_mips_writer_put_instruction (self, 0x8c000000 | (rs.index << 21) |
+      (rd.index << 16) | (src_offset & 0xffff));
 }
 
 void
@@ -736,7 +753,7 @@ gum_mips_writer_put_addu_reg_reg_reg (GumMipsWriter * self,
   gum_mips_writer_put_instruction (self,
       /* See MIPS64 comment in put_lw_reg_reg_offset(). */
 #if GLIB_SIZEOF_VOID_P == 8
-      0x000000a5
+      0x0000002d
 #else
       0x00000021
 #endif
@@ -884,8 +901,8 @@ gum_mips_writer_put_prologue_trampoline (GumMipsWriter * self,
   }
   g_assert (self->pc % 8 == 0);
 
-  gum_mips_writer_put_instruction (self, address >> 32);
-  gum_mips_writer_put_instruction (self, address & 0xffffffff);
+  gum_mips_writer_put_bytes (self, (const guint8 *) &address,
+      sizeof (address));
   gum_mips_writer_put_jr_reg (self, reg);
 }
 

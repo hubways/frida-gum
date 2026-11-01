@@ -6,16 +6,15 @@
 
 #include "gummoduleregistry-priv.h"
 
-#include "gum/gumdarwin.h"
 #include "gumdarwin-priv.h"
 #include "guminterceptor.h"
 #include "guminvocationlistener.h"
 #include "gummodule-darwin.h"
-
+#include "gum/gumdarwin.h"
 #ifdef HAVE_I386
-# include <gum/arch-x86/gumx86writer.h>
+# include "gumx86writer.h"
 #else
-# include <gum/arch-arm64/gumarm64writer.h>
+# include "gumarm64writer.h"
 #endif
 
 #include <dlfcn.h>
@@ -75,7 +74,7 @@ static gboolean gum_try_drive_registry_via_dyld_internals (
     const GumDarwinAllImageInfos * infos);
 static GumAddress gum_resolve_dyld_dec_dl_ref_count (GumAddress dyld_base);
 static gboolean gum_collect_dyld_dec_dl_ref_count (
-    const GumDarwinSymbolDetails * details, gpointer user_data);
+    const GumMachoSymbolDetails * details, gpointer user_data);
 static void gum_arm_resident_add_notifier (void);
 static GumResidentNotifier * gum_find_resident_notifier (void);
 static gboolean gum_resident_notifier_matches (GumResidentNotifier * candidate,
@@ -338,45 +337,53 @@ gum_remove_image (const struct mach_header * mh)
 static void
 gum_module_registry_synchronize_modules (void)
 {
-  GHashTable * modules;
+  GPtrArray * modules;
   uint32_t count, i;
-  GHashTableIter iter;
-  gpointer base_address;
+  GHashTable * loaded_modules;
   GumModule * module;
+  gpointer base_address;
   GQueue added = G_QUEUE_INIT;
+  GHashTableIter iter;
   GQueue removed = G_QUEUE_INIT;
 
-  modules = g_hash_table_new_full (NULL, NULL, NULL, g_object_unref);
+  modules = g_ptr_array_new_with_free_func (g_object_unref);
 
   count = _dyld_image_count ();
   for (i = 0; i != count; i++)
   {
-    const struct mach_header * mh = _dyld_get_image_header (i);
-
-    g_hash_table_insert (modules, GSIZE_TO_POINTER (GUM_ADDRESS (mh)),
-        gum_make_image_module (mh, _dyld_get_image_name (i)));
+    g_ptr_array_add (modules, gum_make_image_module (
+        _dyld_get_image_header (i), _dyld_get_image_name (i)));
   }
+
+  loaded_modules = g_hash_table_new_full (NULL, NULL, NULL, g_object_unref);
 
   gum_module_registry_lock (gum_registry);
 
-  g_hash_table_iter_init (&iter, modules);
-  while (g_hash_table_iter_next (&iter, &base_address, (gpointer *) &module))
+  for (i = 0; i != modules->len; i++)
   {
+    module = g_ptr_array_index (modules, i);
+    base_address =
+        GSIZE_TO_POINTER (gum_module_get_range (module)->base_address);
+
     if (!g_hash_table_contains (gum_current_modules, base_address))
       g_queue_push_tail (&added, g_object_ref (module));
+
+    g_hash_table_insert (loaded_modules, base_address, g_object_ref (module));
   }
 
   g_hash_table_iter_init (&iter, gum_current_modules);
   while (g_hash_table_iter_next (&iter, &base_address, NULL))
   {
-    if (!g_hash_table_contains (modules, base_address))
+    if (!g_hash_table_contains (loaded_modules, base_address))
       g_queue_push_tail (&removed, base_address);
   }
 
   g_hash_table_unref (gum_current_modules);
-  gum_current_modules = modules;
+  gum_current_modules = loaded_modules;
 
   gum_module_registry_unlock (gum_registry);
+
+  g_ptr_array_unref (modules);
 
   while ((base_address = g_queue_pop_head (&removed)) != NULL)
     _gum_module_registry_unregister (gum_registry, GUM_ADDRESS (base_address));
@@ -423,14 +430,14 @@ static GumAddress
 gum_resolve_dyld_dec_dl_ref_count (GumAddress dyld_base)
 {
   GumAddress result = 0;
-  GumDarwinModule * dyld;
+  GumMachoModule * dyld;
 
-  dyld = gum_darwin_module_new_from_memory (NULL, mach_task_self (), dyld_base,
-      GUM_DARWIN_MODULE_FLAGS_NONE, NULL);
+  dyld = gum_macho_module_new_from_memory (NULL, mach_task_self (), dyld_base,
+      GUM_MACHO_MODULE_FLAGS_NONE, NULL);
   if (dyld == NULL)
     return 0;
 
-  gum_darwin_module_enumerate_symbols (dyld, gum_collect_dyld_dec_dl_ref_count,
+  gum_macho_module_enumerate_symbols (dyld, gum_collect_dyld_dec_dl_ref_count,
       &result);
 
   g_object_unref (dyld);
@@ -439,7 +446,7 @@ gum_resolve_dyld_dec_dl_ref_count (GumAddress dyld_base)
 }
 
 static gboolean
-gum_collect_dyld_dec_dl_ref_count (const GumDarwinSymbolDetails * details,
+gum_collect_dyld_dec_dl_ref_count (const GumMachoSymbolDetails * details,
                                    gpointer user_data)
 {
   GumAddress * result = user_data;

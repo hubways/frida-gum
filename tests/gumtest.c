@@ -196,6 +196,7 @@ main (gint argc, gchar * argv[])
   TESTLIST_REGISTER (cfg);
   TESTLIST_REGISTER (cloak);
   TESTLIST_REGISTER (memory);
+  TESTLIST_REGISTER (process_memory);
   TESTLIST_REGISTER (process);
   TESTLIST_REGISTER (thread_registry);
   TESTLIST_REGISTER (module_registry);
@@ -215,10 +216,19 @@ main (gint argc, gchar * argv[])
   if (cs_support (CS_ARCH_ARM64))
     TESTLIST_REGISTER (arm64relocator);
   TESTLIST_REGISTER (interceptor);
+#ifdef HAVE_TINYCC
+  TESTLIST_REGISTER_WITH_DATA (cmodule,
+      GUINT_TO_POINTER (GUM_CMODULE_TOOLCHAIN_INTERNAL));
+#endif
+#if defined (HAVE_WINDOWS) || defined (HAVE_DARWIN) || defined (HAVE_LINUX)
+  TESTLIST_REGISTER_WITH_DATA (cmodule,
+      GUINT_TO_POINTER (GUM_CMODULE_TOOLCHAIN_EXTERNAL));
+  TESTLIST_REGISTER (mapper);
+#endif
 #ifdef HAVE_DARWIN
   TESTLIST_REGISTER (interceptor_darwin);
   TESTLIST_REGISTER (unwind_broker);
-  TESTLIST_REGISTER (darwin_mapper);
+  TESTLIST_REGISTER (macho_mapper);
 #endif
 #if defined (HAVE_LINUX) && defined (HAVE_ARM64)
   TESTLIST_REGISTER (unwind_broker);

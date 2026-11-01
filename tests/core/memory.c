@@ -10,6 +10,9 @@
 #include "testutil.h"
 
 #include "gummemory-priv.h"
+#ifdef HAVE_WINDOWS
+# include "gum/gumwindows.h"
+#endif
 
 #define TESTCASE(NAME) \
     void test_memory_ ## NAME (void)
@@ -46,11 +49,20 @@ TESTLIST_BEGIN (memory)
   TESTENTRY (find_pointers_skips_inaccessible_range_in_parallel_scan)
   TESTENTRY (is_memory_readable_handles_mixed_page_protections)
   TESTENTRY (query_protection_of_unmapped_address_is_not_readable)
+  TESTENTRY (address_spec_handles_distant_addresses)
   TESTENTRY (alloc_n_pages_returns_aligned_rw_address)
   TESTENTRY (alloc_n_pages_near_returns_aligned_rw_address_within_range)
   TESTENTRY (allocate_handles_alignment)
   TESTENTRY (allocate_near_handles_alignment)
+#ifdef HAVE_WINDOWS
+  TESTENTRY (allocate_near_low_address_does_not_fall_back_to_any_address)
+  TESTENTRY (allocate_near_without_candidates_returns_null)
+#endif
   TESTENTRY (mprotect_handles_page_boundaries)
+  TESTENTRY (allocate_routes_code_pages_through_hooks)
+  TESTENTRY (allocate_near_passes_spec_to_hooks)
+  TESTENTRY (mprotect_routes_through_hooks)
+  TESTENTRY (patch_code_routes_through_hooks)
   TESTENTRY (code_allocator_keeps_reusing_freed_slice)
   TESTENTRY (patch_code_does_not_apply_while_threads_suspended)
 TESTLIST_END ()
@@ -63,8 +75,30 @@ typedef struct _TestForEachContext {
   guint expected_size;
 } TestForEachContext;
 
+typedef struct _TestMemoryHooksContext {
+  guint n_allocations;
+  gboolean spec_provided;
+  GumAddressSpec spec;
+  gsize alignment;
+  GumPageProtection allocation_prot;
+
+  guint n_protections;
+  gpointer protected_address;
+  gsize protected_size;
+  GumPageProtection protection_prot;
+
+  guint n_patches;
+} TestMemoryHooksContext;
+
 static gboolean match_found_cb (GumAddress address, gsize size,
     gpointer user_data);
+static gpointer record_allocation (const GumAddressSpec * spec, gsize size,
+    gsize alignment, GumPageProtection prot, gpointer user_data);
+static gboolean record_protection (gpointer address, gsize size,
+    GumPageProtection prot, gpointer user_data);
+static gboolean apply_patch (gpointer address, gconstpointer data, gsize size,
+    gpointer user_data);
+static void write_ret (gpointer mem, gpointer user_data);
 static gpointer gum_patch_lock_holder (gpointer data);
 static void gum_patch_gated_apply (gpointer mem, gpointer user_data);
 
@@ -876,6 +910,19 @@ TESTCASE (query_protection_of_unmapped_address_is_not_readable)
     g_assert_cmpuint (prot & GUM_PAGE_READ, ==, 0);
 }
 
+TESTCASE (address_spec_handles_distant_addresses)
+{
+  GumAddressSpec spec;
+
+  spec.near_address = GSIZE_TO_POINTER (G_MAXSIZE);
+  spec.max_distance = G_MAXSSIZE;
+
+  g_assert_false (gum_address_spec_is_satisfied_by (&spec,
+      GSIZE_TO_POINTER (1)));
+  g_assert_true (gum_address_spec_is_satisfied_by (&spec,
+      GSIZE_TO_POINTER (G_MAXSIZE - G_MAXSSIZE)));
+}
+
 TESTCASE (alloc_n_pages_returns_aligned_rw_address)
 {
   gpointer page;
@@ -972,6 +1019,62 @@ TESTCASE (allocate_near_handles_alignment)
   gum_memory_free (page, size);
 }
 
+#ifdef HAVE_WINDOWS
+
+TESTCASE (allocate_near_low_address_does_not_fall_back_to_any_address)
+{
+  SYSTEM_INFO si;
+  gpointer reservation;
+  GumAddressSpec spec;
+  guint page_size;
+  gpointer page;
+
+  GetSystemInfo (&si);
+  reservation = VirtualAlloc (si.lpMinimumApplicationAddress,
+      2 * si.dwAllocationGranularity, MEM_RESERVE, PAGE_NOACCESS);
+  if (reservation == NULL)
+  {
+    g_test_skip ("Low address range is unavailable");
+    return;
+  }
+
+  spec.near_address = reservation;
+  spec.max_distance = si.dwAllocationGranularity;
+  page_size = gum_query_page_size ();
+
+  page = gum_memory_allocate_near (&spec, page_size, page_size, GUM_PAGE_RW);
+
+  g_assert_null (page);
+
+  VirtualFree (reservation, 0, MEM_RELEASE);
+}
+
+TESTCASE (allocate_near_without_candidates_returns_null)
+{
+  GumAddressSpec spec;
+  guint page_size;
+  gpointer page;
+
+  spec.near_address = NULL;
+  spec.max_distance = 0;
+  page_size = gum_query_page_size ();
+
+  page = gum_memory_allocate_near (&spec, page_size, page_size, GUM_PAGE_RW);
+
+  g_assert_null (page);
+
+#if GLIB_SIZEOF_VOID_P == 8
+  spec.near_address = GSIZE_TO_POINTER (G_MAXSIZE);
+  spec.max_distance = G_MAXSSIZE;
+
+  page = gum_memory_allocate_near (&spec, page_size, page_size, GUM_PAGE_RW);
+
+  g_assert_null (page);
+#endif
+}
+
+#endif
+
 TESTCASE (mprotect_handles_page_boundaries)
 {
   guint8 * pages;
@@ -987,6 +1090,112 @@ TESTCASE (mprotect_handles_page_boundaries)
   pages[page_size] = 0x37;
 
   gum_memory_free (pages, 2 * page_size);
+}
+
+TESTCASE (allocate_routes_code_pages_through_hooks)
+{
+  TestMemoryHooksContext ctx = { 0, };
+  GumMemoryHooks hooks = { NULL, };
+  guint page_size;
+  gpointer data, code;
+
+  hooks.allocate = record_allocation;
+  hooks.user_data = &ctx;
+  gum_memory_set_hooks (&hooks);
+
+  page_size = gum_query_page_size ();
+
+  data = gum_memory_allocate (NULL, page_size, page_size, GUM_PAGE_RW);
+  g_assert_nonnull (data);
+  g_assert_cmpuint (ctx.n_allocations, ==, 0);
+
+  code = gum_memory_allocate (NULL, page_size, 4 * page_size, GUM_PAGE_RX);
+  g_assert_nonnull (code);
+  g_assert_cmpuint (ctx.n_allocations, ==, 1);
+  g_assert_false (ctx.spec_provided);
+  g_assert_cmpuint (ctx.alignment, ==, 4 * page_size);
+  g_assert_cmpuint (ctx.allocation_prot, ==, GUM_PAGE_RX);
+
+  gum_memory_set_hooks (NULL);
+
+  gum_memory_free (code, page_size);
+  gum_memory_free (data, page_size);
+}
+
+TESTCASE (allocate_near_passes_spec_to_hooks)
+{
+  TestMemoryHooksContext ctx = { 0, };
+  GumMemoryHooks hooks = { NULL, };
+  GumAddressSpec spec;
+  guint page_size;
+  gpointer code;
+
+  hooks.allocate = record_allocation;
+  hooks.user_data = &ctx;
+  gum_memory_set_hooks (&hooks);
+
+  spec.near_address = &ctx;
+  spec.max_distance = G_MAXINT32;
+  page_size = gum_query_page_size ();
+
+  code = gum_memory_allocate_near (&spec, page_size, page_size, GUM_PAGE_RX);
+  g_assert_nonnull (code);
+  g_assert_cmpuint (ctx.n_allocations, ==, 1);
+  g_assert_true (ctx.spec_provided);
+  g_assert_true (ctx.spec.near_address == spec.near_address);
+  g_assert_cmpuint (ctx.spec.max_distance, ==, spec.max_distance);
+
+  gum_memory_set_hooks (NULL);
+
+  gum_memory_free (code, page_size);
+}
+
+TESTCASE (mprotect_routes_through_hooks)
+{
+  TestMemoryHooksContext ctx = { 0, };
+  GumMemoryHooks hooks = { NULL, };
+  guint page_size;
+  gpointer page;
+
+  page_size = gum_query_page_size ();
+  page = gum_memory_allocate (NULL, page_size, page_size, GUM_PAGE_RW);
+
+  hooks.protect = record_protection;
+  hooks.user_data = &ctx;
+  gum_memory_set_hooks (&hooks);
+
+  g_assert_true (gum_try_mprotect (page, page_size, GUM_PAGE_RX));
+  g_assert_cmpuint (ctx.n_protections, ==, 1);
+  g_assert_true (ctx.protected_address == page);
+  g_assert_cmpuint (ctx.protected_size, ==, page_size);
+  g_assert_cmpuint (ctx.protection_prot, ==, GUM_PAGE_RX);
+
+  gum_memory_set_hooks (NULL);
+
+  gum_memory_free (page, page_size);
+}
+
+TESTCASE (patch_code_routes_through_hooks)
+{
+  TestMemoryHooksContext ctx = { 0, };
+  GumMemoryHooks hooks = { NULL, };
+  guint page_size;
+  guint8 * code;
+
+  page_size = gum_query_page_size ();
+  code = gum_memory_allocate (NULL, page_size, page_size, GUM_PAGE_RW);
+
+  hooks.patch_code = apply_patch;
+  hooks.user_data = &ctx;
+  gum_memory_set_hooks (&hooks);
+
+  g_assert_true (gum_memory_patch_code (code, 1, write_ret, NULL));
+  g_assert_cmpuint (ctx.n_patches, ==, 1);
+  g_assert_cmphex (code[0], ==, 0xc3);
+
+  gum_memory_set_hooks (NULL);
+
+  gum_memory_free (code, page_size);
 }
 
 TESTCASE (code_allocator_keeps_reusing_freed_slice)
@@ -1032,6 +1241,62 @@ match_found_cb (GumAddress address,
   ctx->number_of_calls++;
 
   return ctx->value_to_return;
+}
+
+static gpointer
+record_allocation (const GumAddressSpec * spec,
+                   gsize size,
+                   gsize alignment,
+                   GumPageProtection prot,
+                   gpointer user_data)
+{
+  TestMemoryHooksContext * ctx = user_data;
+
+  ctx->n_allocations++;
+  ctx->spec_provided = spec != NULL;
+  if (spec != NULL)
+    ctx->spec = *spec;
+  ctx->alignment = alignment;
+  ctx->allocation_prot = prot;
+
+  return gum_memory_allocate (NULL, size, alignment, GUM_PAGE_RW);
+}
+
+static gboolean
+record_protection (gpointer address,
+                   gsize size,
+                   GumPageProtection prot,
+                   gpointer user_data)
+{
+  TestMemoryHooksContext * ctx = user_data;
+
+  ctx->n_protections++;
+  ctx->protected_address = address;
+  ctx->protected_size = size;
+  ctx->protection_prot = prot;
+
+  return TRUE;
+}
+
+static gboolean
+apply_patch (gpointer address,
+             gconstpointer data,
+             gsize size,
+             gpointer user_data)
+{
+  TestMemoryHooksContext * ctx = user_data;
+
+  memcpy (address, data, size);
+  ctx->n_patches++;
+
+  return TRUE;
+}
+
+static void
+write_ret (gpointer mem,
+           gpointer user_data)
+{
+  *((guint8 *) mem) = 0xc3;
 }
 
 TESTCASE (patch_code_does_not_apply_while_threads_suspended)

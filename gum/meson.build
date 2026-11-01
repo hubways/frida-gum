@@ -9,9 +9,9 @@ gum_headers = [
   'gumcodeallocator.h',
   'gumcodesegment.h',
   'gumdarwingrafter.h',
-  'gumdarwinmodule.h',
   'gumdefs.h',
   'gumelfmodule.h',
+  'gumelfmoduleresolver.h',
   'gumevent.h',
   'gumeventsink.h',
   'gumexceptor.h',
@@ -23,6 +23,8 @@ gum_headers = [
   'guminvocationlistener.h',
   'gumkernel.h',
   'gumlibc.h',
+  'gummachomodule.h',
+  'gummapper.h',
   'gummemory.h',
   'gummemoryaccessmonitor.h',
   'gummemorymap.h',
@@ -32,8 +34,13 @@ gum_headers = [
   'gummoduleapiresolver.h',
   'gummodulemap.h',
   'gummoduleregistry.h',
+  'gummoduleresolver.h',
+  'gumnativemoduleresolver.h',
+  'gumnativeprocessmemory.h',
+  'gumpemodule.h',
   'gumprintf.h',
   'gumprocess.h',
+  'gumprocessmemory.h',
   'gumreturnaddress.h',
   'gumspinlock.h',
   'gumstalker.h',
@@ -54,8 +61,8 @@ gum_sources = [
   'gumcodeallocator.c',
   'gumcodesegment.c',
   'gumdarwingrafter.c',
-  'gumdarwinmodule.c',
   'gumelfmodule.c',
+  'gumelfmoduleresolver.c',
   'gumexceptor.c',
   'gumunwindbroker.c',
   'gumeventsink.c',
@@ -66,6 +73,8 @@ gum_sources = [
   'gumkernel.c',
   'gumleb.c',
   'gumlibc.c',
+  'gummachomodule.c',
+  'gummapper.c',
   'gummemory.c',
   'gummemoryaccessmonitor.c',
   'gummemorymap.c',
@@ -75,10 +84,15 @@ gum_sources = [
   'gummodulemap.c',
   'gumprintf.c',
   'gumprocess.c',
+  'gumprocessmemory.c',
   'gumthreadregistry.c',
   'gummodule.c',
   'gummodulefacade.c',
   'gummoduleregistry.c',
+  'gummoduleresolver.c',
+  'gumnativemoduleresolver.c',
+  'gumnativeprocessmemory.c',
+  'gumpemodule.c',
   'gumreturnaddress.c',
   'gumspinlock.c',
   'gumstalker.c',
@@ -104,6 +118,7 @@ gum_backend_headers = []
 if host_os_family == 'windows'
   gum_backend_headers += [
     'backend-windows' / 'include' / 'gum' / 'gumwindows.h',
+    'backend-windows' / 'include' / 'gum' / 'gumwindowsmoduleresolver.h',
     'backend-dbghelp' / 'include' / 'gum' / 'gumdbghelp.h',
     'backend-dbghelp' / 'include' / 'gum' / 'gumdbghelpbacktracer.h',
   ]
@@ -115,6 +130,8 @@ if host_os_family == 'windows'
     'backend-windows' / 'gumthreadregistry-windows.c',
     'backend-windows' / 'gummoduleregistry-windows.c',
     'backend-windows' / 'gummodule-windows.c',
+    'backend-windows' / 'gumwindowsmoduleresolver.c',
+    'backend-windows' / 'gumpemapper.c',
     'backend-windows' / 'gumtls-windows.c',
     'backend-dbghelp' / 'gumdbghelp.c',
     'backend-dbghelp' / 'gumdbghelpbacktracer.c',
@@ -134,7 +151,6 @@ if host_os_family == 'darwin'
     'backend-darwin' / 'include' / 'gum' / 'gumdarwin.h',
     'backend-darwin' / 'include' / 'gum' / 'gumdarwinbacktracer.h',
     'backend-darwin' / 'include' / 'gum' / 'gumdarwinsymbolicator.h',
-    'backend-darwin' / 'include' / 'gum' / 'gumdarwinmapper.h',
     'backend-darwin' / 'include' / 'gum' / 'gumdarwinmoduleresolver.h',
   ]
   gum_sources += [
@@ -152,7 +168,7 @@ if host_os_family == 'darwin'
     'backend-darwin' / 'gummodule-darwin.c',
     'backend-posix' / 'gumexceptor-posix.c',
     'backend-darwin' / 'gumunwindbroker-darwin.c',
-    'backend-darwin' / 'gumdarwinmapper.c',
+    'backend-darwin' / 'gummachomapper.c',
     'backend-darwin' / 'gumdarwinmoduleresolver.c',
   ]
   if have_ptrauth
@@ -253,7 +269,10 @@ if host_os_family == 'none'
 endif
 
 if host_executable_format == 'elf'
-  gum_sources += 'backend-elf' / 'gummodule-elf.c'
+  gum_sources += [
+    'backend-elf' / 'gumelfmapper.c',
+    'backend-elf' / 'gummodule-elf.c',
+  ]
   if host_os_family != 'qnx'
     gum_sources += 'backend-elf' / 'gummoduleregistry-elf.c'
   endif
