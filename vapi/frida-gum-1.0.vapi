@@ -580,10 +580,19 @@ namespace Gum {
 		public void with_lock_held (Gum.Cloak.LockedFunc func);
 		public bool is_locked ();
 
+		public void add_observer (Gum.Cloak.Observer observer);
+		public void remove_observer (Gum.Cloak.Observer observer);
+
 		public delegate bool FoundThreadFunc (Gum.ThreadId id);
 		public delegate bool FoundRangeFunc (Gum.MemoryRange range);
 		public delegate bool FoundFDFunc (int fd);
 		public delegate void LockedFunc ();
+
+		[CCode (type_cname = "GumCloakObserverInterface", type_id = "GUM_TYPE_CLOAK_OBSERVER")]
+		public interface Observer : GLib.Object {
+			public abstract void thread_added (Gum.ThreadId id);
+			public abstract void thread_removed (Gum.ThreadId id);
+		}
 	}
 
 	public struct CpuContext {
@@ -753,6 +762,7 @@ namespace Gum {
 	public struct ThreadDetails {
 		public Gum.ThreadFlags flags;
 		public Gum.ThreadId id;
+		public unowned string? name;
 		public Gum.ThreadState state;
 		public Gum.CpuContext cpu_context;
 		public Gum.ThreadEntrypoint entrypoint;
@@ -896,6 +906,27 @@ namespace Gum {
 
 	public class ModuleRegistry : GLib.Object {
 		public static void set_rtld_notifier_offsets ([CCode (array_length_type = "guint")] uint[] offsets);
+	}
+
+	public class ThreadRegistry : GLib.Object {
+		public static void set_provider (Gum.ThreadProvider? provider);
+		public static unowned ThreadRegistry obtain ();
+		public void enumerate_threads (Gum.FoundThreadFunc func);
+		public void lock ();
+		public void unlock ();
+		public void register (Gum.ThreadDetails thread);
+		public void unregister (Gum.ThreadId id);
+		public void rename (Gum.ThreadId id, string? name);
+
+		public signal void thread_added (Gum.ThreadDetails thread);
+		public signal void thread_removed (Gum.ThreadDetails thread);
+		public signal void thread_renamed (Gum.ThreadDetails thread, string? previous_name);
+	}
+
+	[CCode (type_cname = "GumThreadProviderInterface")]
+	public interface ThreadProvider : GLib.Object {
+		public abstract void activate (Gum.ThreadRegistry registry);
+		public abstract void deactivate ();
 	}
 
 	public class UnwindBroker : GLib.Object {
