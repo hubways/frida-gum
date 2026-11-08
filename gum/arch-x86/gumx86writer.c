@@ -2085,10 +2085,10 @@ gum_x86_writer_put_mov_reg_offset_ptr_reg (GumX86Writer * self,
 
   gum_x86_writer_put_u8 (self, 0x89);
 
-  if (dst_offset == 0 && dst.meta != GUM_X86_META_XBP)
+  if (dst_offset == 0 && (dst.index & 7) != 5)
   {
     gum_x86_writer_put_u8 (self, 0x00 | (src.index << 3) | dst.index);
-    if (dst.meta == GUM_X86_META_XSP)
+    if ((dst.index & 7) == 4)
       gum_x86_writer_put_u8 (self, 0x24);
   }
   else
@@ -2096,7 +2096,7 @@ gum_x86_writer_put_mov_reg_offset_ptr_reg (GumX86Writer * self,
     gum_x86_writer_put_u8 (self, (offset_fits_in_i8 ? 0x40 : 0x80) |
         (src.index << 3) | dst.index);
 
-    if (dst.meta == GUM_X86_META_XSP)
+    if ((dst.index & 7) == 4)
       gum_x86_writer_put_u8 (self, 0x24);
 
     if (offset_fits_in_i8)
@@ -2245,7 +2245,8 @@ gum_x86_writer_put_mov_reg_near_ptr (GumX86Writer * self,
 
   gum_x86_writer_describe_cpu_reg (self, dst_reg, &dst);
 
-  if (!gum_x86_writer_put_prefix_for_registers (self, &dst, 32, &dst, NULL))
+  if (!gum_x86_writer_put_prefix_for_registers (self, &dst, 32, &dst, &dst,
+      &dst, NULL))
     return FALSE;
 
   if (self->target_cpu == GUM_CPU_IA32 && dst.meta == GUM_X86_META_XAX)
@@ -2286,7 +2287,8 @@ gum_x86_writer_put_mov_near_ptr_reg (GumX86Writer * self,
 
   gum_x86_writer_describe_cpu_reg (self, src_reg, &src);
 
-  if (!gum_x86_writer_put_prefix_for_registers (self, &src, 32, &src, NULL))
+  if (!gum_x86_writer_put_prefix_for_registers (self, &src, 32, &src, &src,
+      &src, NULL))
     return FALSE;
 
   if (self->target_cpu == GUM_CPU_IA32 && src.meta == GUM_X86_META_XAX)
@@ -3481,5 +3483,51 @@ gum_get_jcc_opcode (x86_insn instruction_id)
     case X86_INS_JRCXZ:
     default:
       return 0xe3;
+  }
+}
+
+GumX86Reg
+gum_x86_reg_from_capstone (x86_reg reg)
+{
+  switch (reg)
+  {
+    case X86_REG_EAX: return GUM_X86_EAX;
+    case X86_REG_ECX: return GUM_X86_ECX;
+    case X86_REG_EDX: return GUM_X86_EDX;
+    case X86_REG_EBX: return GUM_X86_EBX;
+    case X86_REG_ESP: return GUM_X86_ESP;
+    case X86_REG_EBP: return GUM_X86_EBP;
+    case X86_REG_ESI: return GUM_X86_ESI;
+    case X86_REG_EDI: return GUM_X86_EDI;
+    case X86_REG_R8D: return GUM_X86_R8D;
+    case X86_REG_R9D: return GUM_X86_R9D;
+    case X86_REG_R10D: return GUM_X86_R10D;
+    case X86_REG_R11D: return GUM_X86_R11D;
+    case X86_REG_R12D: return GUM_X86_R12D;
+    case X86_REG_R13D: return GUM_X86_R13D;
+    case X86_REG_R14D: return GUM_X86_R14D;
+    case X86_REG_R15D: return GUM_X86_R15D;
+    case X86_REG_EIP: return GUM_X86_EIP;
+
+    case X86_REG_RAX: return GUM_X86_RAX;
+    case X86_REG_RCX: return GUM_X86_RCX;
+    case X86_REG_RDX: return GUM_X86_RDX;
+    case X86_REG_RBX: return GUM_X86_RBX;
+    case X86_REG_RSP: return GUM_X86_RSP;
+    case X86_REG_RBP: return GUM_X86_RBP;
+    case X86_REG_RSI: return GUM_X86_RSI;
+    case X86_REG_RDI: return GUM_X86_RDI;
+    case X86_REG_R8: return GUM_X86_R8;
+    case X86_REG_R9: return GUM_X86_R9;
+    case X86_REG_R10: return GUM_X86_R10;
+    case X86_REG_R11: return GUM_X86_R11;
+    case X86_REG_R12: return GUM_X86_R12;
+    case X86_REG_R13: return GUM_X86_R13;
+    case X86_REG_R14: return GUM_X86_R14;
+    case X86_REG_R15: return GUM_X86_R15;
+    case X86_REG_RIP: return GUM_X86_RIP;
+
+    default:
+      return GUM_X86_NONE;
   }
 }
